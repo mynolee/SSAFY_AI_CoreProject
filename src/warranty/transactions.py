@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from contextlib import nullcontext
 
 from .errors import ServiceError
 
@@ -198,9 +199,11 @@ def verify_accounting(conn, trade_id):
 class TradeService:
     """All identities are server identities, never identities embedded in payloads."""
 
-    def __init__(self, db, review_validator=None):
+    def __init__(self, db, review_validator=None, review_guard=None):
         self.db = db
         self.review_validator = review_validator
+        validator_owner = getattr(review_validator, "__self__", None)
+        self.review_guard = review_guard or getattr(validator_owner, "review_guard", None)
         from .worker import SettlementWorker
         self.worker = SettlementWorker(db)
 
@@ -352,6 +355,15 @@ class TradeService:
                                    "payload": payload, "expected_version": expected_version})
         except (TypeError, ValueError):
             fail("INVALID_ACTION_PAYLOAD", "Payload must contain valid JSON values.", 400)
+        target = self._current_review_target(actor, trade_id, action, payload, key)
+        guard = self.review_guard() if target is not None and self.review_guard is not None else nullcontext()
+        with guard:
+            current_review = self._revalidate_review(target)
+            return self._mutate_guarded(actor, trade_id, action, payload, key, expected_version,
+                                        request_hash, current_review)
+
+    def _mutate_guarded(self, actor, trade_id, action, payload, key, expected_version,
+                        request_hash, current_review):
         validated_review = None
         # No model, HTTP, file inspection or application callback inside the write transaction.
         if action == "adopt_review":
@@ -386,13 +398,109 @@ class TradeService:
                 fail("TRADE_TERMINAL", "This trade has ended.", 409)
             if trade["version"] != expected_version:
                 fail("VERSION_CONFLICT", "Reload the current trade before submitting a new change.", 409)
-            changed = self._apply(conn, trade, actor, action, payload, validated_review)
+            changed = self._apply(conn, trade, actor, action, payload, validated_review, current_review)
             if changed:
                 conn.execute("UPDATE trades SET version=version+1 WHERE trade_id=?", (trade_id,))
                 audit(conn, trade_id, actor, action, trade_id, "ACCEPTED")
             response = self._view(conn, actor, trade_id)
             self._remember(conn, actor, action, key, request_hash, response)
             return response
+
+    def _current_review_target(self, actor, trade_id, action, payload, key):
+        """Find a *new* W/PAY target before taking the policy/readiness guard."""
+        if action not in ("reserve", "retry"):
+            return None
+        with self.db.connect() as conn:
+            trade = self._trade(conn, actor, trade_id)
+            self._party(trade, actor)
+            if conn.execute("SELECT 1 FROM idempotency_records WHERE actor=? AND scope=? AND key=?",
+                            (actor, action, key)).fetchone():
+                return None
+            if action == "reserve":
+                proposal = self._proposal(conn, trade, payload.get("proposal_id"))
+                if conn.execute("SELECT 1 FROM settlement_groups WHERE proposal_id=? AND revision=?",
+                                (proposal["proposal_id"], proposal["revision"])).fetchone():
+                    return None
+                positive = conn.execute("SELECT 1 FROM allocations WHERE proposal_id=? AND component='W' AND pay_won>0",
+                                        (proposal["proposal_id"],)).fetchone()
+            else:
+                operation = self._operation(conn, trade, payload.get("operation_id"))
+                positive = operation["status"] == "FAILED" and operation["component"] == "W" and operation["direction"] == "PAY"
+                proposal = self._proposal(conn, trade, operation["proposal_id"])
+            if not positive:
+                return None
+            review = conn.execute("SELECT * FROM review_snapshots WHERE trade_id=? AND review_id=?",
+                                  (trade_id, proposal["review_id"])).fetchone()
+            if review is None:
+                return None  # The ordinary domain gate supplies the precise error.
+            snapshot = json.loads(review["payload_json"])
+            adopter = conn.execute("SELECT actor FROM audit_events WHERE trade_id=? AND action='adopt_review_snapshot' AND target_id=? ORDER BY rowid DESC LIMIT 1",
+                                   (trade_id, review["review_id"])).fetchone()
+            if adopter is None:
+                # Legacy immutable snapshots predate the adoption audit target.
+                # Resolve ownership only from server-persisted conversation rows.
+                owners = set()
+                for row in conn.execute("SELECT user_id,result_json FROM chat_history WHERE item_id=?", (trade["item_id"],)):
+                    saved = json.loads(row["result_json"])
+                    if saved.get("review_id") == snapshot.get("review_id"):
+                        owners.add(row["user_id"])
+                adopter_id = next(iter(owners)) if len(owners) == 1 else None
+            else:
+                adopter_id = adopter[0]
+            if adopter_id not in (trade["buyer_id"], trade["seller_id"]):
+                adopter_id = None
+            return {"review_id": review["review_id"], "hash": review["hash"],
+                    "item_id": trade["item_id"], "proposal_id": proposal["proposal_id"],
+                    "adopter": adopter_id, "snapshot": snapshot}
+
+    @staticmethod
+    def _review_identity(snapshot):
+        evidence = snapshot.get("evidence", [])
+        conditions = snapshot.get("conditions", [])
+        return digest({"review_id": snapshot.get("review_id"), "review_hash": snapshot.get("review_hash"),
+            "revision": snapshot.get("revision"), "classification": snapshot.get("classification"),
+            "applicability": snapshot.get("applicability"),
+            "document_hashes": sorted(snapshot.get("document_hashes", [])),
+            "evidence": sorted(({
+                key: entry.get(key) for key in ("evidence_id", "id", "item_id", "document_id", "version_id",
+                                               "document_version_id", "body_hash", "role", "source_type", "revision")
+            } for entry in evidence if isinstance(entry, dict)), key=canonical),
+            "conditions": sorted(({"text": condition.get("text"),
+                "evidence_ids": sorted(condition.get("evidence_ids", []))}
+                for condition in conditions if isinstance(condition, dict)), key=canonical)})
+
+    def _revalidate_review(self, target):
+        if target is None:
+            return None
+        checked = {"review_id": target["review_id"], "hash": target["hash"],
+                   "proposal_id": target["proposal_id"], "revision": target["snapshot"].get("revision")}
+        try:
+            if self.review_validator is None or target["adopter"] is None:
+                fail("W_CURRENT_REVIEW_REQUIRED", "The adopted review cannot be verified against current server evidence.")
+            if target["snapshot"].get("revision") and self.review_guard is None:
+                fail("W_CURRENT_REVIEW_REQUIRED", "Current document review protection is not configured.")
+            result = self.review_validator(target["adopter"], target["item_id"], target["snapshot"].get("review_id"))
+            if (not isinstance(result, dict) or result.get("applicability_ok") is not True or
+                    result.get("classification") not in ("TRANSFERABLE", "CONDITIONAL") or
+                    result.get("missing_information") or result.get("conflicts") or
+                    self._review_identity(result) != self._review_identity(target["snapshot"])):
+                fail("W_CURRENT_REVIEW_REQUIRED", "Current source approval and the exact adopted review must remain valid.")
+        except ServiceError as error:
+            checked["error"] = error
+        except (TypeError, ValueError, KeyError):
+            checked["error"] = ServiceError("W_CURRENT_REVIEW_REQUIRED", "The current adopted review could not be verified.")
+        return checked
+
+    @staticmethod
+    def _require_current_review(conn, proposal, review, checked):
+        if checked is None or checked["review_id"] != review["review_id"] or checked["hash"] != review["hash"] or checked["proposal_id"] != proposal["proposal_id"]:
+            fail("W_CURRENT_REVIEW_REQUIRED", "Reload and verify the exact current adopted review.")
+        if checked.get("error") is not None:
+            raise checked["error"]
+        if checked["revision"] is not None:
+            active = conn.execute("SELECT revision FROM index_manifests WHERE active=1").fetchone()
+            if active is None or active[0] != checked["revision"]:
+                fail("W_CURRENT_REVIEW_REQUIRED", "The adopted document revision is no longer active.")
 
     @staticmethod
     def _remember(conn, actor, action, key, request_hash, response):
@@ -439,7 +547,7 @@ class TradeService:
             fail("OPERATION_NOT_FOUND", status=404)
         return op
 
-    def _apply(self, conn, trade, actor, action, payload, validated_review):
+    def _apply(self, conn, trade, actor, action, payload, validated_review, current_review=None):
         tid = trade["trade_id"]
         contract = self._contract(conn, trade)
         if action == "contract":
@@ -518,6 +626,7 @@ class TradeService:
             rid = identifier()
             revision = conn.execute("SELECT COALESCE(MAX(revision),0)+1 FROM review_snapshots WHERE trade_id=?", (tid,)).fetchone()[0]
             conn.execute("INSERT INTO review_snapshots(review_id,trade_id,revision,hash,classification,applicability_ok,conditions_ok,payload_json) VALUES(?,?,?,?,?,?,?,?)", (rid, tid, revision, digest(review), classification, int(review.get("applicability_ok") is True), int(review.get("conditions_ok") is True), canonical(review)))
+            audit(conn, tid, actor, "adopt_review_snapshot", rid, "ADOPTED")
             contract_revision = contract["revision"] + 1
             terms = json.loads(contract["terms_json"])
             body = {"item_id": trade["item_id"], "revision": contract_revision, "D": contract["D"], "W": contract["W"], "terms": terms, "review_id": rid}
@@ -578,7 +687,7 @@ class TradeService:
             self._party(trade, actor)
             proposal = self._proposal(conn, trade, payload.get("proposal_id"))
             allocations = [dict(r) for r in conn.execute("SELECT * FROM allocations WHERE proposal_id=?", (proposal["proposal_id"],))]
-            self._validate_reservation(conn, trade, proposal, allocations)
+            self._validate_reservation(conn, trade, proposal, allocations, current_review)
             gid = identifier()
             conn.execute("INSERT INTO settlement_groups(group_id,trade_id,proposal_id,revision,status) VALUES(?,?,?,?,'RESERVED')", (gid, tid, proposal["proposal_id"], proposal["revision"]))
             attempts = []
@@ -603,7 +712,7 @@ class TradeService:
                 fail("MAX_ATTEMPTS_REACHED", status=409)
             proposal = self._proposal(conn, trade, op["proposal_id"])
             allocation = {"component": op["component"], "pay_won": op["amount"] if op["direction"] == "PAY" else 0, "refund_won": op["amount"] if op["direction"] == "REFUND" else 0}
-            self._validate_reservation(conn, trade, proposal, [allocation])
+            self._validate_reservation(conn, trade, proposal, [allocation], current_review)
             attempt = op["attempt_no"] + 1
             if conn.execute("UPDATE settlement_operations SET status='RESERVED',attempt_no=? WHERE operation_id=? AND status='FAILED' AND attempt_no=?", (attempt, op["operation_id"], op["attempt_no"])).rowcount != 1:
                 fail("RETRY_CONFLICT", status=409)
@@ -724,7 +833,7 @@ class TradeService:
     def _resolution_context(conn, trade_id, components):
         return sorted(r["resolution_id"] for r in conn.execute("SELECT scope,resolution_id FROM disputes WHERE trade_id=? AND status='RESOLVED'", (trade_id,)) if r["scope"] == "BOTH" or r["scope"] in components)
 
-    def _validate_reservation(self, conn, trade, proposal, allocations):
+    def _validate_reservation(self, conn, trade, proposal, allocations, current_review=None):
         tid = trade["trade_id"]
         contract = self._contract(conn, trade)
         self._proposal_current(conn, trade, proposal)
@@ -773,6 +882,7 @@ class TradeService:
                 actors = {r[0] for r in conn.execute("SELECT actor FROM evidence_confirmations WHERE trade_id=? AND evidence_id=? AND target_hash=?", (tid, evidence["evidence_id"], evidence["hash"]))}
                 if not {trade["buyer_id"], trade["seller_id"]}.issubset(actors):
                     fail("W_BILATERAL_EVIDENCE_REQUIRED")
+                self._require_current_review(conn, proposal, review, current_review)
 
     @staticmethod
     def _job(conn, trade_id, group_id, attempts):
