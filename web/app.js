@@ -1,7 +1,7 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const state = { actor: null, csrf: null, selected: null, trade: null, offset: 0, limit: 12, total: 0, applicability: new Map(), reviews: new Map(), mutationKeys: new Map(), busy: new Set() };
+const state = { actor: null, csrf: null, selected: null, trade: null, offset: 0, limit: 12, total: 0, applicability: new Map(), reviews: new Map(), jobs: new Map(), jobWatches: new Map(), mutationKeys: new Map(), busy: new Set() };
 const won = (value) => value === null || value === undefined ? "미확인" : `${Number(value).toLocaleString("ko-KR")}원`;
 const asText = (value) => typeof value === "string" ? value : JSON.stringify(value, null, 2);
 const clear = (node) => node.replaceChildren();
@@ -16,6 +16,8 @@ function readinessText(readiness = {}) {
   return `${STATUS[status] || "문서 준비 여부 미확인"}${reasons.length ? `\n${lines(reasons)}` : ""}`;
 }
 const scope = (itemId = state.selected?.item_id) => JSON.stringify([state.actor, itemId]);
+const JOB_STAGES = { QUEUED: "작업 대기", RECOVERING: "중단된 작업 복구", QUERYING: "문서 검색어 준비", DISCOVERING: "등록 문서 탐색", SELECTING: "문서 후보 선별", FETCHING: "승인된 문서 수집", CHECKING_DOCUMENTS: "등록 문서·권한 확인", PARSING_STORED_BODIES: "본문 추출", INDEXING: "문서 색인", INDEX_READY: "검색 준비", DOC_BLOCKED: "필요 자료 확인", COMPLETED: "준비 완료", FAILED: "처리 실패" };
+const JOB_TERMINAL = new Set(["COMPLETED", "FAILED", "BLOCKED"]);
 function mutationKey(target, action, payload, version) {
   const intent = JSON.stringify([state.actor, target, action, payload, version]);
   if (!state.mutationKeys.has(intent)) state.mutationKeys.set(intent, crypto.randomUUID());
@@ -71,6 +73,60 @@ function requireItem() {
 function fact(parent, label, value) {
   const box = el("div", undefined, "fact");
   box.append(el("small", label), el("span", value)); parent.append(box);
+}
+async function loadRuntime() {
+  let node = $("runtime-status");
+  if (!node) {
+    node = el("div", undefined, "readiness"); node.id = "runtime-status";
+    node.setAttribute("role", "status"); node.setAttribute("aria-live", "polite");
+    document.querySelector(".page-heading").after(node);
+  }
+  if (!state.actor) { node.textContent = "로그인 후 모델과 문서 처리의 설정 준비 상태를 확인할 수 있습니다."; return; }
+  const runtime = await api("/runtime");
+  const adapter = (value = {}) => `${value.is_mock ? "MOCK · 모의" : value.provider === "gms" ? "GMS · LIVE 전용" : value.provider === "openai" ? "외부 모델" : "미설정"} · ${value.ready ? "설정 준비됨" : value.configured ? "준비 확인 필요" : "설정 필요"}`;
+  const live = runtime.live || {};
+  const liveText = runtime.chat?.provider === "gms" || runtime.embedding?.provider === "gms"
+    ? `\nGMS LIVE ${live.ready ? "설정 준비됨" : live.enabled ? "예산·승인 확인 필요" : "사용 설정 필요"} · ${live.budget_confirmed ? "예산 확인됨" : "예산 미확인"}\nGMS 실행은 명시적 CLI 실행 범위에서만 허용됩니다. 화면 진입·새로고침과 일반 작업 재개는 LIVE 실행 승인을 부여하지 않습니다.` : "";
+  node.textContent = `답변 ${adapter(runtime.chat)}\n검색 임베딩 ${adapter(runtime.embedding)}\n문서 처리기 ${runtime.document_worker_enabled ? "설정됨" : "설정 필요"} · 등록 수집 대상 ${runtime.collection?.registered_target_count || 0}개${liveText}\n표시된 준비 상태는 설정과 처리 범위 확인 결과이며 실제 모델 연결 성공이나 공식 문서 확보를 뜻하지 않습니다.`;
+}
+function renderJob(job, itemId, actor, waiting = false) {
+  if (state.selected?.item_id !== itemId || state.actor !== actor) return;
+  const node = $("job-status"); clear(node);
+  const status = job.status === "QUEUED" ? "대기 중" : STATUS[job.status] || "상태 확인";
+  const message = `${JOB_STAGES[job.stage] || "문서 처리"} · ${status}\n등록 후보 ${job.candidate_count || 0}건 · 처리 본문 ${job.body_count || 0}건 · 색인 청크 ${job.chunk_count || 0}개${job.attempt_no ? ` · 시도 ${job.attempt_no}회` : ""}`;
+  node.append(el("p", message, "subtle"));
+  if (job.failure_code) node.append(el("p", `${job.failure_code} · ${LABELS[job.failure_code] || "문서 처리 조건과 서버 상태를 확인해 주세요."}`, "subtle"));
+  if (waiting) node.append(el("p", "작업은 서버에서 계속 진행됩니다. 상태 새로고침으로 결과를 다시 확인하세요.", "subtle"));
+  if (!job.job_id) return;
+  node.append(el("p", `작업 ID: ${job.job_id}`, "subtle"));
+  const refresh = el("button", "상태 새로고침", "secondary"); refresh.type = "button";
+  refresh.addEventListener("click", () => run("job-refresh", async () => {
+    const current = await api(`/index-jobs/${encodeURIComponent(job.job_id)}`);
+    await watchJob(current, itemId, actor);
+  }));
+  node.append(refresh);
+  if (job.retryable === true && JOB_TERMINAL.has(job.status)) {
+    const retry = el("button", "문서 준비 재시도", "secondary"); retry.type = "button";
+    retry.addEventListener("click", () => run("job-retry", async () => {
+      const queued = await api(`/index-jobs/${encodeURIComponent(job.job_id)}/retry`, { method: "POST", body: {} });
+      await watchJob(queued, itemId, actor);
+    }));
+    node.append(retry);
+  }
+}
+async function watchJob(initial, itemId, actor) {
+  const key = JSON.stringify([actor, itemId]); const token = Symbol("document-job-watch");
+  state.jobWatches.set(key, token);
+  let job = initial;
+  for (let tries = 0; tries < 60; tries++) {
+    if (state.jobWatches.get(key) !== token || state.selected?.item_id !== itemId || state.actor !== actor) return;
+    state.jobs.set(key, job); renderJob(job, itemId, actor);
+    if (!job.job_id || JOB_TERMINAL.has(job.status)) return;
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    if (state.jobWatches.get(key) !== token || state.selected?.item_id !== itemId || state.actor !== actor) return;
+    job = await api(`/index-jobs/${encodeURIComponent(job.job_id)}`);
+  }
+  state.jobs.set(key, job); renderJob(job, itemId, actor, true);
 }
 function itemCard(item) {
   const button = el("button", undefined, `item-card${state.selected?.item_id === item.item_id ? " selected" : ""}`);
@@ -147,6 +203,8 @@ async function selectItem(itemId) {
   fact($("item-meta"), "정보 구분", item.is_synthetic ? "합성 시연 항목" : "등록 메타데이터 · 판매 미검증");
   $("readiness").textContent = `${readinessText(item.readiness)}\n공식 본문·적용성이 확인되기 전에는 이전 가능 조건을 단정하지 않습니다.`;
   $("job-status").textContent = "";
+  const savedJob = state.jobs.get(scope(itemId));
+  if (savedJob) renderJob(savedJob, itemId, state.actor, !JOB_TERMINAL.has(savedJob.status));
   $("classification").textContent = "검토 전"; clear($("answer-meta")); clear($("evidence"));
   $("evidence").append(el("p", "이 항목 답변의 실제 인용 근거만 표시합니다.", "empty"));
   clear($("checklist")); $("checklist").append(el("p", "적용 정보를 입력한 후 체크리스트를 확인하세요.", "empty"));
@@ -174,7 +232,8 @@ function renderEvidence(result) {
   for (const item of cited) {
     const id = item.evidence_id || item.id;
     const card = el("article", undefined, "evidence-card");
-    card.append(el("strong", `[${id}] ${item.title || "제목 미확인"}`), el("small", `${item.source_type || "종류 미확인"} · ${item.role || item.document_role || "역할 미확인"}${item.page ? ` · ${item.page}쪽` : ""}${item.section ? ` · ${item.section}` : ""}`));
+    const marker = Number.isInteger(item.number) && item.number > 0 ? `[${item.number}]` : "근거 번호 미확인";
+    card.append(el("strong", `${marker} ${item.title || "제목 미확인"}`), el("small", `${item.source_type || "종류 미확인"} · ${item.role || item.document_role || "역할 미확인"}${item.page ? ` · ${item.page}쪽` : ""}${item.section ? ` · ${item.section}` : ""}`), el("small", `근거 ID: ${id}`));
     if (item.text || item.excerpt) card.append(el("p", item.excerpt || item.text));
     const href = item.source_url || item.url;
     try {
@@ -354,6 +413,10 @@ $("login").addEventListener("click", () => run("login", async () => {
   if (state.selected) state.applicability.set(scope(), applicability());
   const data = await api("/session", { method: "POST", body: { actor: $("actor").value } });
   state.actor = data.actor; state.csrf = data.csrf_token; $("session-status").textContent = `${data.actor} 로그인됨`;
+  await loadRuntime();
+  $("job-status").textContent = "";
+  const savedJob = state.selected && state.jobs.get(scope());
+  if (savedJob) renderJob(savedJob, state.selected.item_id, state.actor, !JOB_TERMINAL.has(savedJob.status));
   if (state.selected) { restoreApplicability(state.selected.item_id); clear($("answer-meta")); clear($("evidence")); clear($("checklist")); $("classification").textContent = "검토 전"; await loadHistory(state.selected.item_id); }
   if (tradeId()) await reloadTrade();
   notice("로컬 시연 사용자로 로그인했습니다.", true);
@@ -375,15 +438,9 @@ $("chat-form").addEventListener("submit", (event) => { event.preventDefault(); r
 $("checklist-button").addEventListener("click", () => run("checklist", async () => { const id = requireItem(); const actor = state.actor; const data = await api(`/items/${encodeURIComponent(id)}/checklist`, { method: "POST", body: { applicability: applicability() } }); if (state.selected?.item_id === id && state.actor === actor) renderChecklist(data); }));
 $("prepare").addEventListener("click", () => run("prepare", async () => {
   const itemId = requireItem(); const actor = state.actor; $("job-status").textContent = "등록된 문서 준비 작업을 요청하고 있습니다…";
-  let job = await api(`/items/${encodeURIComponent(itemId)}/index-jobs`, { method: "POST", body: {} });
-  for (let tries = 0; tries < 60; tries++) {
-    if (state.selected?.item_id !== itemId || state.actor !== actor) return;
-    const stage = { CHECKING_DOCUMENTS: "등록 문서·권한 확인", PARSING_STORED_BODIES: "본문 추출", INDEXING: "문서 색인", INDEX_READY: "검색 준비", DOC_BLOCKED: "필요 자료 확인" }[job.stage] || "문서 처리";
-    $("job-status").textContent = `${stage} · ${STATUS[job.status] || "상태 확인"}\n등록 후보 ${job.candidate_count || 0}건 · 처리 본문 ${job.body_count || 0}건 · 색인 청크 ${job.chunk_count || 0}개${job.failure_code ? `\n${LABELS[job.failure_code] || "문서 준비 작업을 완료하지 못했습니다. 필요한 자료와 출처 이용 범위를 확인하세요."}` : ""}`;
-    if (!job.job_id || ["COMPLETED", "SUCCEEDED", "FAILED", "BLOCKED", "DOC_BLOCKED", "READY"].includes(job.status)) break;
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-    job = await api(`/index-jobs/${encodeURIComponent(job.job_id)}`);
-  }
+  const question = $("question").value.trim();
+  const job = await api(`/items/${encodeURIComponent(itemId)}/index-jobs`, { method: "POST", body: { applicability: applicability(), ...(question ? { question } : {}) } });
+  await watchJob(job, itemId, actor);
 }));
 $("trade-create").addEventListener("submit", (event) => { event.preventDefault(); run("create-trade", async () => {
   const reason = $("refund-condition").value.trim();
@@ -398,4 +455,5 @@ $("advanced-action").addEventListener("submit", (event) => { event.preventDefaul
 run("initial", async () => {
   await loadItems();
   try { const data = await api("/session"); state.actor = data.actor; state.csrf = data.csrf_token; $("actor").value = data.actor; $("session-status").textContent = `${data.actor} 로그인됨`; } catch (error) { if (error.code !== "AUTH_REQUIRED") throw error; }
+  await loadRuntime();
 });

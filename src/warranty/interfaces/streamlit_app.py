@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -29,6 +30,12 @@ ERRORS = {
     "NO_RESULTS": "확인할 수 있는 결과가 없습니다. 조건을 바꾸거나 필요한 자료를 확인해 주세요.",
     "APPLICABILITY_UNKNOWN": "가입일·지역·플랜 등 적용성 입력을 확인해 주세요.",
     "MODEL_OUTPUT_INVALID": "답변 형식을 검증하지 못했습니다. 다시 질문해 주세요.",
+    "MODEL_REMOTE_BLOCKED": "실모델 사용이나 외부 처리에 필요한 허용 범위를 서버에서 확인해 주세요.",
+    "MODEL_UNAVAILABLE": "모델 응답을 받지 못했습니다. 서버의 연결 설정과 제공기관 상태를 확인해 주세요.",
+    "PROMPT_MISSING": "서버의 답변 설정이 준비되지 않았습니다. 운영자가 설정을 확인해야 합니다.",
+    "JOB_QUEUE_UNAVAILABLE": "문서 준비 작업을 접수할 수 없습니다. 서버 처리기 상태를 확인해 주세요.",
+    "JOB_NOT_FOUND": "현재 사용자가 조회할 수 있는 문서 작업을 찾지 못했습니다.",
+    "INVALID_RESPONSE": "서버 응답을 확인할 수 없습니다. 잠시 후 다시 조회해 주세요.",
     "CONFLICT": "자료 또는 현재 상태가 서로 맞지 않습니다. 최신 상태와 누락 정보를 확인해 주세요.",
     "VERSION_CONFLICT": "다른 작업으로 상태가 바뀌었습니다. 화면을 새로고침해 주세요.",
     "FORBIDDEN": "현재 시연 사용자는 이 작업의 권한이 없습니다.",
@@ -65,7 +72,32 @@ ERRORS.update({
     "UNFUNDED_CANNOT_CLOSE": "예치되지 않은 계약은 정산 완료로 종료할 수 없습니다.",
     "FUNDED_CANNOT_CANCEL": "이미 예치된 거래입니다. 계약 조건에 따라 정산안을 합의해 주세요.",
     "MAX_ATTEMPTS_REACHED": "이 작업은 재시도 한도에 도달했습니다.",
+    "JOBS_UNAVAILABLE": "문서 작업 처리기가 아직 연결되지 않았습니다. 서버 설정을 확인해 주세요.",
+    "DOCUMENT_JOB_FAILED": "문서 준비를 마치지 못했습니다. 작업 단계와 자료를 확인해 주세요.",
+    "JOB_INTERRUPTED": "문서 작업이 중단되었습니다. 서버 처리기의 복구 상태를 확인해 주세요.",
+    "JOB_RETRY_LIMIT": "문서 작업의 재시도 한도에 도달했습니다.",
+    "DATASET_CHANGED": "입력 자료가 변경되었습니다. 현재 항목으로 새 문서 작업을 요청해 주세요.",
+    "PROMPT_CONFIG_MISSING": "서버의 답변 설정이 없습니다. 운영자가 비공개 설정을 확인해야 합니다.",
+    "PROMPT_CONFIG_INVALID": "서버의 답변 설정을 검증하지 못했습니다. 운영자가 확인해야 합니다.",
+    "SOURCE_REVIEW_MISSING": "해당 출처에 필요한 이용 범위 확인이 없습니다.",
+    "SOURCE_NOT_REGISTERED": "서버에 등록된 공식 출처가 필요합니다.",
+    "COLLECTION_DISABLED": "서버의 문서 수집 설정이 비활성입니다.",
+    "NETWORK_DISABLED": "외부 본문 수집이 비활성입니다. 서버의 허용 범위를 확인해 주세요.",
+    "SEARCH_UNAVAILABLE": "공식 문서 후보 탐색 설정을 확인해 주세요.",
+    "SEARCH_FAILED": "공식 문서 후보를 탐색하지 못했습니다.",
+    "SEARCH_PROVIDER_UNAVAILABLE": "문서 탐색 제공기관을 사용할 수 없습니다.",
+    "HTTP_RATE_LIMITED": "출처가 요청 빈도를 제한했습니다. 서버가 안내한 재시도 상태를 확인해 주세요.",
+    "HTTP_FAILED": "공식 출처에 연결하지 못했습니다. 문서 작업 상태를 확인해 주세요.",
+    "DOCUMENT_VERSION_CONFLICT": "등록된 문서 버전이 달라졌습니다. 문서 연결을 확인해 주세요.",
+    "LIVE_BUDGET_UNCONFIRMED": "GMS 가격·크레딧 예산이 확정되지 않아 LIVE 실행이 보류되었습니다.",
+    "LIVE_BUDGET_UNAVAILABLE": "GMS 예산 상태를 확인할 수 없습니다. 서버 운영자가 확인해야 합니다.",
+    "CREDIT_LIMIT_REACHED": "승인된 GMS 크레딧 사용 한도에 도달했습니다.",
+    "USAGE_LIMIT_REACHED": "승인된 LIVE 요청 사용 한도에 도달했습니다.",
+    "PROCESSING_APPROVAL_REQUIRED": "LIVE 실행에 필요한 처리 범위·사용 예산을 확인해야 합니다.",
+    "LIVE_PURPOSE_REQUIRED": "허용된 목적의 명시적 CLI LIVE 실행이 필요합니다.",
 })
+for _code in ("JOB_CLAIM_LOST", "JOB_PROGRESS_INVALID", "JOB_REQUEST_INVALID", "JOB_RESULT_INVALID"):
+    ERRORS[_code] = "문서 작업의 실행 상태를 확인하지 못했습니다. 서버 처리기 상태를 확인해 주세요."
 APPLICABILITY_LABELS = {
     "country": "가입 국가·지역",
     "enrollment_date": "가입일 (YYYY-MM-DD)",
@@ -74,6 +106,23 @@ APPLICABILITY_LABELS = {
     "channel": "가입 채널",
     "document_type": "적용 문서 종류",
 }
+JOB_ACTIVE = frozenset({"QUEUED", "RUNNING"})
+JOB_TERMINAL = frozenset({"COMPLETED", "BLOCKED", "FAILED"})
+JOB_LABELS = {"QUEUED": "접수됨 · 처리 대기", "RUNNING": "진행 중", "COMPLETED": "완료",
+              "BLOCKED": "자료·허용 범위 확인 필요", "FAILED": "실패"}
+JOB_STAGES = {
+    "QUEUED": "작업 대기", "RECOVERING": "중단된 작업 복구", "QUERYING": "검색어 생성",
+    "DISCOVERING": "공식 문서 후보 탐색", "SELECTING": "후보 선별", "FETCHING": "허용된 본문 수집",
+    "CHECKING_DOCUMENTS": "문서·이용 범위 확인", "PARSING_STORED_BODIES": "저장 본문 파싱",
+    "INDEXING": "문서 색인", "INDEX_READY": "색인 준비 완료", "DOC_BLOCKED": "문서 준비 보류",
+    "COMPLETED": "작업 완료", "FAILED": "작업 실패",
+}
+JOB_FIELDS = frozenset({"job_id", "item_id", "requester", "status", "stage", "failure_code",
+                        "candidate_count", "body_count", "chunk_count", "revision", "created_at",
+                        "updated_at", "attempt_no", "retryable"})
+LIVE_PURPOSE_LABELS = {"evaluation": "평가", "verification": "검증", "final_verification": "최종 검증",
+                       "demo": "시연", "embedding_preparation": "임베딩 준비"}
+GMS_UI_NOTICE = "GMS LIVE는 명시한 CLI 명령에서만 실행합니다. 일반 화면에서는 GMS 문서 준비·재시도·질문을 실행하지 않습니다."
 
 
 def conversation_key(actor: str, item_id: str) -> str:
@@ -173,7 +222,9 @@ def _evidence(st: Any, result: dict[str, Any]) -> None:
         return
     for number, row in enumerate(rows, 1):
         with st.container(border=True):
-            st.text(f"[{number}] {row.get('title', '제목 미확인')}")
+            source_number = row.get("number")
+            citation_number = source_number if type(source_number) is int and source_number > 0 else number
+            st.text(f"[{citation_number}] {row.get('title', '제목 미확인')}")
             source_type = {"metadata": "메타데이터", "official_document": "공식 문서",
                            "synthetic_document": "합성 시연 문서"}.get(row.get("source_type"), "종류 미확인")
             st.text(f"유형: {source_type} · 근거 ID: {row.get('evidence_id', '')}")
@@ -198,6 +249,8 @@ def _review(st: Any, result: dict[str, Any], show_evidence: bool = True) -> None
     st.caption("약관과 자료에 대한 분류입니다. 실제 보증 이전 완료나 정산 승인을 의미하지 않습니다.")
     if str(result.get("model", "")).startswith("MOCK"):
         st.warning("MOCK · 결정적 모의 응답입니다. 실제 LLM 검증 결과가 아닙니다.")
+    elif result.get("model"):
+        st.caption("실모델 모드 · 적용성·근거와 지급 조건은 서버가 별도로 검증합니다.")
     st.text(str(result.get("answer", "아래 조건과 미확인 정보를 확인해 주세요.")))
     for label, key in (("확인이 필요한 조건", "conditions"), ("추가로 필요한 정보", "missing_information"),
                        ("서로 맞지 않는 정보", "conflicts")):
@@ -239,6 +292,7 @@ def _catalog(st: Any, app: Any) -> str | None:
     counts[2].metric("현재 공식 문서 본문" if corpus is not None else "전달 자료의 공식 본문",
                      (corpus if corpus is not None else summary).get("official_document_body_count", 0))
     if corpus is not None:
+        st.text(f"메타데이터 색인: {corpus.get('metadata_count', 0)}개")
         st.text(f"현재 색인 · 공식 청크 {corpus.get('official_document_chunk_count', 0)}개 · 합성 시연 본문 {corpus.get('synthetic_document_body_count', 0)}개 · 합성 청크 {corpus.get('synthetic_document_chunk_count', 0)}개")
     st.caption("항목 수는 판매 중인 매물 수가 아닙니다. 미확인 요금과 이전 여부는 확인값으로 취급하지 않습니다. 항목별 문서 준비 상태도 함께 확인하세요.")
     with st.form("catalog_search"):
@@ -304,8 +358,8 @@ def _details(st: Any, app: Any, item: dict[str, Any]) -> None:
     st.text("이전 여부: " + ({True: "메타데이터상 가능", False: "메타데이터상 불가"}.get(transfer, "미확인")))
     st.text(f"판매 상태: {item.get('sale_status', 'NOT_VERIFIED')}")
     readiness = item.get("readiness") or {}
-    if readiness.get("documents") == "DOC_BLOCKED" or readiness.get("status") == "DOC_BLOCKED":
-        st.warning("DOC_BLOCKED · 이 항목의 공식 문서 본문이 준비되지 않았습니다. 메타데이터만으로 보증 이전을 확정하지 않습니다.")
+    st.text("메타데이터 로드: " + ("준비됨" if readiness.get("status") == "META_READY" else "상태 확인 필요"))
+    st.caption("메타데이터와 공식 문서 본문은 별도 자료입니다. 현재 공식 문서 준비 상태는 아래에서 확인하세요.")
     url = source_url(item.get("source_url"))
     if url:
         st.link_button("메타데이터 원문 출처", url)
@@ -321,32 +375,207 @@ def _applicability(st: Any, actor: str, item_id: str) -> dict[str, str]:
     return applicability_inputs(values)
 
 
+def _read_runtime_status(st: Any, app: Any) -> dict[str, Any] | None:
+    getter = getattr(app, "runtime_status", None)
+    ok, status = _call(st, getter) if callable(getter) else (True, {})
+    if not ok:
+        return None
+    if not isinstance(status, dict):
+        _error(st, {"code": "INVALID_RESPONSE"})
+        return None
+    return status
+
+
+def gms_selected(status: dict[str, Any]) -> bool:
+    return any(isinstance(status.get(field), dict) and status[field].get("provider") == "gms"
+               for field in ("chat", "embedding"))
+
+
+def _ordinary_model_action_allowed(st: Any, app: Any) -> bool:
+    """UI requests never grant the server's explicit CLI LIVE execution scope."""
+    status = _read_runtime_status(st, app)
+    if status is None:
+        return False
+    if gms_selected(status):
+        st.warning(GMS_UI_NOTICE)
+        return False
+    return True
+
+
+def _live_status(st: Any, app: Any) -> None:
+    getter = getattr(app, "live_status", None)
+    ok, value = _call(st, getter) if callable(getter) else (True, {})
+    value = value if ok and isinstance(value, dict) else {}
+    st.caption("개발·회귀 검증: Codex·MOCK. GMS 70,000크레딧 사용 계획은 평가·검증·시연과 이에 필요한 임베딩 준비 범위에서 관리합니다.")
+    st.caption("화면 조회·새로고침은 GMS 호출을 만들지 않습니다. LIVE 실행 권한은 명시한 CLI 명령의 서버 범위에서만 부여됩니다.")
+    if not value:
+        st.text("GMS LIVE 사전 설정: 확인되지 않음")
+        return
+    st.text("GMS LIVE 실행 설정: " + ("활성" if value.get("enabled") is True else "비활성"))
+    if value.get("budget_confirmed") is not True:
+        st.warning("GMS 가격·예산 범위가 확정되지 않아 LIVE 준비를 완료하지 못했습니다.")
+    elif value.get("ready") is not True:
+        st.warning("GMS LIVE 준비 미완료 · 서버의 연결 설정과 허용 범위를 확인해야 합니다.")
+    else:
+        st.text("GMS LIVE 사전 설정: 확인됨 · 명시한 CLI 실행 필요")
+    purposes = value.get("purposes")
+    if isinstance(purposes, list):
+        labels = [label for purpose, label in LIVE_PURPOSE_LABELS.items() if purpose in purposes]
+        st.text("LIVE 설정 목적: " + (", ".join(labels) if labels else "확인되지 않음"))
+
+
+def _runtime_status(st: Any, app: Any) -> dict[str, Any]:
+    """Read only public status methods; never inspect credentials or enter LIVE."""
+    status = _read_runtime_status(st, app) or {}
+    with st.expander("모델·문서 수집 연결 상태", expanded=True):
+        columns = st.columns(2)
+        for column, field, label in zip(columns, ("chat", "embedding"), ("대화 모델", "임베딩 모델")):
+            value = status.get(field) or {}
+            if not value:
+                column.text(f"{label}: 준비 상태 미확인")
+                continue
+            provider = {"mock": "MOCK", "openai": "OpenAI", "gms": "GMS", "local": "로컬"}.get(value.get("provider"), "제공자 미확인")
+            if value.get("is_mock") is True:
+                column.text(f"{label}: {provider} · 오프라인 모의 모드")
+            elif value.get("configured") is not True:
+                column.warning(f"{label}: {provider} · 서버 설정 미완료")
+            elif value.get("ready") is not True:
+                column.warning(f"{label}: {provider} · 준비 미완료")
+            else:
+                column.text(f"{label}: {provider} · 실모델 설정 준비됨")
+        st.caption("설정 준비 상태를 조회한 결과입니다. 실제 모델 호출 성공이나 답변 품질 검증을 뜻하지 않습니다. MOCK 응답·임베딩은 합성 검증용입니다.")
+        _live_status(st, app)
+        if gms_selected(status):
+            st.info(GMS_UI_NOTICE)
+        collection = status.get("collection") or {}
+        if collection:
+            count = collection.get("registered_target_count")
+            st.text("등록된 문서 수집 대상: " + (f"{count}개" if type(count) is int else "미확인"))
+            st.text("문서 수집 설정: " + ("활성" if collection.get("enabled") is True else "비활성"))
+            st.text("외부 본문 수집: " + ("서버 허용 범위에서 사용" if collection.get("network_enabled") is True else "비활성"))
+        for field, label in (("external_processing_approved", "외부 문서 처리"),
+                             ("question_processing_approved", "질문의 외부 처리")):
+            if field in status:
+                st.text(label + ": " + ("허용 범위 확인됨" if status[field] is True else "허용 범위 확인 필요"))
+        if "document_worker_enabled" in status and status["document_worker_enabled"] is not True:
+            st.warning("문서 자동 처리기가 비활성입니다. 접수된 작업은 서버 처리기가 실행될 때까지 대기할 수 있습니다.")
+        st.caption("연결 설정과 허용 범위는 서버에서 관리합니다. 이 화면은 키·환경 설정·전체 프롬프트를 입력하거나 표시하지 않습니다.")
+    return status
+
+
+def _document_readiness(st: Any, result: dict[str, Any] | None) -> None:
+    readiness = (result or {}).get("readiness") or {}
+    status = readiness.get("status")
+    if status == "INDEX_READY":
+        st.success("문서 준비: 연결된 문서 색인을 사용할 수 있습니다.")
+        st.caption("공식 문서와 합성 시연 문서는 현재 집계와 실제 인용 근거의 유형으로 구분합니다.")
+        st.caption("문서 준비와 계약 적용성 확인, 실제 보증 이전, 지급 승인은 각각 확인해야 합니다.")
+    elif status == "DOC_BLOCKED":
+        st.warning("DOC_BLOCKED · 공식 문서 준비가 보류되었습니다. 해당 항목의 본문·이용 범위·적용 정보를 확인해 주세요.")
+    elif status == "INDEX_EMPTY":
+        st.warning("INDEX_EMPTY · 문서 검색 색인이 없습니다. 문서 준비 작업을 요청해 주세요.")
+    else:
+        st.caption("공식 문서 준비 상태를 아직 확인하지 못했습니다.")
+
+
+def _store_job(st: Any, job: Any, actor: str, item_id: str, key: str) -> bool:
+    if (not isinstance(job, dict) or not isinstance(job.get("job_id"), str)
+            or not 0 < len(job["job_id"]) <= 128):
+        _error(st, {"code": "INVALID_RESPONSE"})
+        return False
+    if job.get("requester", actor) != actor or job.get("item_id", item_id) != item_id:
+        _error(st, {"code": "FORBIDDEN"})
+        return False
+    st.session_state[key] = {field: value for field, value in job.items() if field in JOB_FIELDS}
+    return True
+
+
+def _enqueue_job(st: Any, app: Any, actor: str, item_id: str, applicability: dict[str, str],
+                 question: str, key: str) -> None:
+    if not _ordinary_model_action_allowed(st, app):
+        return
+    with st.spinner("문서 준비 작업을 접수하는 중…"):
+        ok, job = _call(st, lambda: app.rag.enqueue_prepare(actor, item_id, applicability=applicability,
+                                                           question=question.strip() or None))
+    if ok and _store_job(st, job, actor, item_id, key):
+        st.rerun()
+
+
 def _job(st: Any, job: dict[str, Any]) -> None:
-    st.text(f"작업: {job.get('job_id', '')}")
-    st.text(f"현재 단계: {job.get('stage', '미확인')} · 상태: {job.get('status', '미확인')}")
+    st.text(f"작업 ID: {job.get('job_id', '')}")
+    status = job.get("status")
+    label = JOB_LABELS.get(status, "상태 미확인")
+    if status == "COMPLETED":
+        st.success("문서 준비 작업: " + label)
+    elif status in JOB_ACTIVE:
+        st.info("문서 준비 작업: " + label)
+    else:
+        st.warning("문서 준비 작업: " + label)
+    st.text("현재 단계: " + JOB_STAGES.get(job.get("stage"), "단계 확인 중"))
     st.text(f"후보 {job.get('candidate_count', 0)} · 본문 {job.get('body_count', 0)} · 청크 {job.get('chunk_count', 0)}")
+    stamp = job.get("updated_at")
+    if isinstance(stamp, str):
+        try:
+            updated = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            updated = updated.replace(tzinfo=timezone.utc) if updated.tzinfo is None else updated
+            st.caption("서버 상태 갱신: " + updated.astimezone(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M:%S KST"))
+        except ValueError:
+            pass
     if job.get("failure_code"):
-        _error(st, {"code": job["failure_code"]})
+        _error(st, {"code": job["failure_code"], "retryable": job.get("retryable") is True})
 
 
-def _rag(st: Any, app: Any, actor: str, item: dict[str, Any], applicability: dict[str, str]) -> None:
+def _document_job(st: Any, app: Any, actor: str, item_id: str, applicability: dict[str, str],
+                  question: str, prefix: str, model_actions_blocked: bool = False) -> None:
+    key = f"job:{prefix}"
+    job = st.session_state.get(key)
+    if not job:
+        st.caption("문서 준비를 요청하면 작업 ID와 실제 처리 단계가 여기에 표시됩니다.")
+        return
+    active = job.get("status") in JOB_ACTIVE
+
+    @st.fragment(run_every=2.0 if active else None)
+    def panel():
+        if (st.session_state.get("warranty_demo_actor") != actor
+                or st.session_state.get("warranty_selected_item") != item_id):
+            return
+        current = st.session_state.get(key)
+        if not current:
+            return
+        refresh = st.button("작업 상태 새로고침", key=f"job_refresh:{prefix}")
+        was_active = current.get("status") in JOB_ACTIVE
+        if was_active or refresh:
+            ok, latest = _call(st, lambda: app.rag.job(actor, current["job_id"]))
+            if not ok or not _store_job(st, latest, actor, item_id, key):
+                st.session_state.pop(key, None)
+                return
+            current = st.session_state[key]
+            if was_active and current.get("status") in JOB_TERMINAL:
+                st.rerun()
+        _job(st, current)
+        if current.get("status") in JOB_ACTIVE:
+            st.caption("2초마다 작업 상태를 조회합니다. 창이 열려 있는 동안 자동 갱신되며 수동 새로고침도 가능합니다.")
+        elif current.get("status") != "COMPLETED" and current.get("retryable") is True:
+            st.caption("아래 요청은 현재 적용성 입력으로 새 작업을 접수합니다. 처리 허용 범위와 자료를 먼저 확인해 주세요.")
+            if st.button("문서 준비 다시 요청", key=f"job_retry:{prefix}", disabled=model_actions_blocked):
+                _enqueue_job(st, app, actor, item_id, applicability, question, key)
+    panel()
+
+
+def _rag(st: Any, app: Any, actor: str, item: dict[str, Any], applicability: dict[str, str],
+         runtime_status: dict[str, Any] | None = None) -> None:
     item_id = item["item_id"]
     prefix = conversation_key(actor, item_id)
+    model_actions_blocked = gms_selected(runtime_status or {})
+    checklist_ok, checklist = _call(st, lambda: app.rag.checklist(item_id, applicability=applicability, user_id=actor))
+    _document_readiness(st, checklist if checklist_ok else None)
     with st.expander("문서 준비·작업 진행"):
         st.caption("서버에 등록되고 이용 범위가 승인된 문서만 처리합니다. 임의 URL 입력과 실제 파일 업로드는 비활성입니다.")
-        if st.button("문서 준비 요청", key=f"prepare:{prefix}"):
-            with st.spinner("등록 문서와 처리 권한을 확인하는 중…"):
-                ok, job = _call(st, lambda: app.rag.prepare(actor, item_id))
-            if ok:
-                st.session_state[f"job:{prefix}"] = job
-        job = st.session_state.get(f"job:{prefix}")
-        if job:
-            if st.button("작업 상태 새로고침", key=f"job_refresh:{prefix}"):
-                ok, latest = _call(st, lambda: app.rag.job(actor, job["job_id"]))
-                if ok:
-                    job = latest
-                    st.session_state[f"job:{prefix}"] = job
-            _job(st, job)
+        question = st.text_input("문서 탐색 질문 (선택)", key=f"job_question:{prefix}", max_chars=2000,
+                                 placeholder="확인할 조건을 입력하면 해당 질문으로 문서 준비를 요청합니다.")
+        if st.button("문서 준비 요청", key=f"prepare:{prefix}", disabled=model_actions_blocked):
+            _enqueue_job(st, app, actor, item_id, applicability, question, f"job:{prefix}")
+        _document_job(st, app, actor, item_id, applicability, question, prefix, model_actions_blocked)
     chat_tab, checklist_tab = st.tabs(["항목별 질문", "보증 이전 조건표·체크리스트"])
     with chat_tab:
         st.caption("선택 항목과 현재 시연 사용자별로 대화를 보관합니다. 질문은 승인이나 지급을 실행하지 않습니다.")
@@ -362,11 +591,11 @@ def _rag(st: Any, app: Any, actor: str, item: dict[str, Any], applicability: dic
         with st.form(f"ask:{prefix}", clear_on_submit=True):
             question = st.text_area("이 항목에 질문하기", placeholder="예: 가입일에 따라 적용되는 이전 조건이 달라지나요?", max_chars=2000)
             top_k = st.select_slider("외부 문서 검색 수", options=[3, 6, 10], value=6)
-            submitted = st.form_submit_button("근거와 함께 질문", type="primary")
+            submitted = st.form_submit_button("근거와 함께 질문", type="primary", disabled=model_actions_blocked)
         if submitted:
             if not question.strip():
                 st.warning("질문을 입력해 주세요.")
-            else:
+            elif _ordinary_model_action_allowed(st, app):
                 with st.spinner("선택 항목의 근거를 검색하고 답변을 생성하는 중…"):
                     ok, result = _call(st, lambda: app.rag.ask(actor, item_id, question.strip(),
                                                               applicability=applicability, top_k=top_k))
@@ -374,9 +603,8 @@ def _rag(st: Any, app: Any, actor: str, item: dict[str, Any], applicability: dic
                     st.session_state[f"latest_review:{prefix}"] = result
                     st.rerun()
     with checklist_tab:
-        ok, result = _call(st, lambda: app.rag.checklist(item_id, applicability=applicability, user_id=actor))
-        if ok:
-            _review(st, result)
+        if checklist_ok:
+            _review(st, checklist)
             st.caption("거래에 채택하면 서버가 해당 검토와 문서 버전의 불변 스냅샷을 만듭니다. 채팅을 추가하는 것과 구분됩니다.")
 
 
@@ -615,6 +843,7 @@ def run(application: Any = None, st: Any = None) -> None:
         st.success("서버가 요청을 처리했습니다. 최신 상태를 확인하세요.")
     st.info(NOTICE)
     try:
+        runtime_status = _runtime_status(st, app)
         selected = _catalog(st, app)
         if selected is None:
             return
@@ -624,7 +853,7 @@ def run(application: Any = None, st: Any = None) -> None:
         st.divider()
         _details(st, app, item)
         applicability = _applicability(st, actor, selected)
-        _rag(st, app, actor, item, applicability)
+        _rag(st, app, actor, item, applicability, runtime_status)
         _trade(st, app, actor, selected)
     except Exception as exc:
         _error(st, exc)
