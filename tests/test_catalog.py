@@ -160,11 +160,15 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual([r["item_id"] for r in result["unknown"]], ["SYNTHETIC-002"])
 
     def test_natural_language_conditions_are_checked_on_values(self):
-        result = self.search_catalog().search("SKT 월 5천원 이하이고 양도 가능한 상품 추천")
-        self.assertEqual(len(result["matches"]), 1)
-        self.assertEqual(len(result["unknown"]), 1)
-        self.assertEqual(result["keywords"], [])
-        self.assertEqual(result["unknown"][0]["unknown_conditions"], ["monthly_fee_won", "transfer_allowed"])
+        for query in ("SKT 월 5천원 이하이고 양도 가능한 상품 추천",
+                      "SKT, 월 5천원 이하, 양도 가능한 항목",
+                      "SKT 월 보험료가 5천원 이하의 양도가 가능한 상품"):
+            with self.subTest(query=query):
+                result = self.search_catalog().search(query)
+                self.assertEqual(len(result["matches"]), 1)
+                self.assertEqual(len(result["unknown"]), 1)
+                self.assertEqual(result["keywords"], [])
+                self.assertEqual(result["unknown"][0]["unknown_conditions"], ["monthly_fee_won", "transfer_allowed"])
 
     def test_strict_money_boundaries_and_decimal_units(self):
         catalog = self.search_catalog()
@@ -180,11 +184,16 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(len(catalog.search("SKT", provider="KT")["matches"]), 0)
 
     def test_contract_limits_are_not_monthly_prices(self):
-        result = self.search_catalog().search("보장 한도 100만원 이상")
-        self.assertEqual(result["matches"], [])
-        self.assertEqual(len(result["unknown"]), 3)
-        self.assertEqual(result["conditions"], [])
-        self.assertEqual(result["unsupported_conditions"], ["coverage_limit_won"])
+        for query, missing in (("보장 한도 100만원 이상", "coverage_limit_won"),
+                               ("보장 100만원 이상", "coverage_limit_won"),
+                               ("자기부담금이 없는 상품", "deductible_won"),
+                               ("보증 2년 이상", "coverage_months")):
+            with self.subTest(query=query):
+                result = self.search_catalog().search(query)
+                self.assertEqual(result["matches"], [])
+                self.assertEqual(len(result["unknown"]), 3)
+                self.assertEqual(result["conditions"], [])
+                self.assertEqual(result["unsupported_conditions"], [missing])
 
     def test_current_sale_status_never_becomes_availability(self):
         result = self.search_catalog().search("현재 신규 가입 가능한 상품")

@@ -240,9 +240,9 @@ class Catalog:
         # Remove unsupported contract conditions before parsing any money: a
         # coverage limit of 1 million won is not a monthly-fee constraint.
         unknown_patterns = (
-            ("coverage_limit_won", r"(?:보장\s*한도|보상\s*한도|보장\s*금액)(?:\s*[\d,.]+\s*(?:만|천)?\s*원?\s*(?:이상|이하|미만|초과)?)?"),
-            ("deductible_won", r"자기\s*부담금(?:\s*[\d,.]+\s*(?:만|천)?\s*원?\s*(?:이상|이하|미만|초과)?)?"),
-            ("coverage_months", r"(?:보장|보증|가입)\s*기간(?:\s*\d+\s*(?:개월|년)\s*(?:이상|이하)?)?|\d+\s*(?:개월|년)\s*(?:이상|이하)?\s*(?:보장|보증)"),
+            ("coverage_limit_won", r"(?:보장\s*한도|보상\s*한도|보장\s*금액)(?:\s*[\d,.]+\s*(?:만|천)?\s*원?\s*(?:이상|이하|미만|초과)?)?|(?:보장|보상)\s*[\d,.]+\s*(?:만|천)?\s*원\s*(?:이상|이하|미만|초과)?"),
+            ("deductible_won", r"자기\s*부담금(?:\s*(?:이|가)?\s*(?:없는|없이|없고|없음|[\d,.]+\s*(?:만|천)?\s*원?\s*(?:이상|이하|미만|초과)?))?"),
+            ("coverage_months", r"(?:보장|보증|가입)\s*기간(?:\s*\d+\s*(?:개월|년)\s*(?:이상|이하)?)?|(?:보장|보증)\s*\d+\s*(?:개월|년)\s*(?:이상|이하)?|\d+\s*(?:개월|년)\s*(?:이상|이하)?\s*(?:보장|보증)"),
             ("transfer_limit", r"(?:양도|이전)\s*\d+\s*회\s*(?:이상|이하)?|\d+\s*회\s*(?:이상|이하)?\s*(?:양도|이전)"),
             ("sale_status", r"(?:현재\s*)?(?:신규\s*)?(?:판매\s*중|가입\s*가능)(?:한)?"),
         )
@@ -250,14 +250,14 @@ class Catalog:
             if re.search(pattern, residual):
                 unsupported.append(field)
                 residual = re.sub(pattern, " ", residual)
-        money = r"(?:월\s*(?:요금|이용료|보험료)?\s*)?(\d[\d,]*(?:\.\d+)?)\s*(만|천)?\s*원?\s*(이하|미만|이내|까지|이상|초과)"
+        money = r"(?:월\s*(?:요금|이용료|보험료)?\s*(?:이|가)?\s*)?(\d[\d,]*(?:\.\d+)?)\s*(만|천)?\s*원?\s*(이하|미만|이내|까지|이상|초과)"
         for match in list(re.finditer(money, residual)):
             amount = Decimal(match[1].replace(",", "")) * {None: 1, "만": 10000, "천": 1000}[match[2]]
             if amount != amount.to_integral_value():
                 raise ServiceError("SEARCH_CONDITION_INVALID", "금액 조건은 원 단위 정수로 입력해 주세요.")
             conditions.append({"field": "monthly_fee_won", "operator": {"이하": "le", "미만": "lt", "이내": "le", "까지": "le", "이상": "ge", "초과": "gt"}[match[3]], "value": int(amount)})
         residual = re.sub(money, " ", residual)
-        transfer = r"(?:양도|이전)\s*(불가능(?:한)?|불가(?:한)?|안\s*되\w*|가능(?:한)?|할\s*수\s*있\w*)|transfer(?:able)?"
+        transfer = r"(?:양도|이전)(?:가|이)?\s*(불가능(?:한)?|불가(?:한)?|안\s*되\w*|가능(?:한)?|할\s*수\s*있\w*)|transfer(?:able)?"
         for match in re.finditer(transfer, residual):
             negative = bool(match[1] and re.match(r"불가|불가능|안", match[1]))
             conditions.append({"field": "transfer_allowed", "operator": "eq", "value": not negative})
@@ -269,8 +269,9 @@ class Catalog:
                 value = value.replace(english, korean)
             conditions.append({"field": "device_category", "operator": "device", "value": value})
         residual = re.sub(device, " ", residual)
-        residual = re.sub(r"(?:상품|보험|보증|조건|추천|찾아\w*|검색\w*|보여\w*|알려\w*|가능한|가능|이면서|이고|인|으로|이하|원|월|와|과|및|하고|해줘|주세요)", " ", residual)
-        tokens = re.findall(r"[a-z0-9가-힣+]+", residual)
+        residual = re.sub(r"(?:상품|항목|보험|보증|조건|추천|찾아\w*|검색\w*|보여\w*|알려\w*|가능한|가능|원하는|맞는|이면서|이고|인|으로|이하|원|월|와|과|및|하고|해줘|주세요)", " ", residual)
+        tokens = [token for token in re.findall(r"[a-z0-9가-힣+]+", residual)
+                  if token not in {"의", "이", "가", "을", "를", "한", "은", "는", "에", "등"}]
         return conditions, unsupported, tokens
 
     @staticmethod
