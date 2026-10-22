@@ -88,26 +88,60 @@ class RagService:
                 connection.execute("INSERT OR IGNORE INTO items(item_id,name,provider) VALUES(?,?,?)",
                     (item["item_id"], item.get("name", item["item_id"]), item.get("provider", "UNKNOWN")))
         if self.vectors.embeddings.is_remote:
-            matches = getattr(self.vectors, "metadata_matches", None)
-            self.metadata_count = self.vectors.meta.count() if callable(matches) and matches(self._metadata_records, self.dataset_hash) else 0
+            self._metadata_state()
         else:
-            self.metadata_count = self.vectors.index_metadata(self._metadata_records)
+            self.vectors.index_metadata(self._metadata_records, dataset_hash=self.dataset_hash)
+            self._metadata_state()
         self.graph = self._build_graph()
 
-    def prepare_metadata(self, actor):
-        """Explicit metadata indexing; constructing a remote app makes no paid call."""
+    def _metadata_selection(self, item_ids=None):
+        if item_ids is None:
+            return self._metadata_records
+        if (not isinstance(item_ids, list) or not item_ids or
+                any(not isinstance(value, str) or not value.strip() for value in item_ids) or
+                len(item_ids) != len(set(item_ids))):
+            raise ServiceError("INVALID_INPUT", "Choose distinct catalog item identities.", 422, False)
+        known = {record["item_id"]: record for record in self._metadata_records}
+        if any(value not in known for value in item_ids):
+            raise ServiceError("INVALID_INPUT", "A selected metadata identity is not in the catalog.", 422, False)
+        return [known[value] for value in item_ids]
+
+    def _metadata_state(self, item_ids=None):
+        selected = self._metadata_selection(item_ids)
+        prepared = self.vectors.prepared_metadata_ids(self._metadata_records, self.dataset_hash)
+        self.metadata_count = len(prepared)
+        self.metadata_complete = self.vectors.metadata_matches(self._metadata_records, self.dataset_hash)
+        return {"metadata_count": self.metadata_count, "metadata_complete": self.metadata_complete,
+            "metadata_index_matches": self.vectors.metadata_matches(selected, self.dataset_hash, exact=item_ids is None)}
+
+    def prepare_metadata(self, actor, item_ids=None):
+        """Prepare only explicitly chosen remote metadata; app startup is read-only."""
         self.registry.policy.require_capability(actor, "DATA_MANAGER")
-        sources = sorted({item.get("source_id", "") for item in self.catalog.items})
-        if self.vectors.embeddings.is_remote:
-            if not self.settings.remote_models:
-                raise ServiceError("MODEL_REMOTE_BLOCKED", "Remote embeddings are disabled.", 503, False)
-            for source_id in sources:
-                self.registry._require(source_id, "external_process", actor, self.dataset_hash)
-        with self._embedding_context([{"kind": "metadata", "source_id": source,
-                "version_id": self.dataset_hash, "actor": actor} for source in sources]):
-            self.metadata_count = self.vectors.index_metadata(self._metadata_records, dataset_hash=self.dataset_hash)
-        return {"status": "META_READY", "metadata_count": self.metadata_count, "dataset_hash": self.dataset_hash,
-                "embedding_model": self.vectors.embeddings.name}
+        remote = self.vectors.embeddings.is_remote
+        if remote and (not self.settings.remote_models or item_ids is None):
+            raise ServiceError("MODEL_REMOTE_BLOCKED", "Remote metadata preparation requires enabled models and explicit item identities.", 503, False)
+        selected = self._metadata_selection(item_ids)
+        sources = sorted({self.catalog.get(record["item_id"]).get("source_id", "") for record in selected})
+        with self.review_guard():
+            if remote:
+                for source_id in sources:
+                    self.registry._require(source_id, "external_process", actor, self.dataset_hash)
+            # Repeated preparation is a verified local read, including with an
+            # adapter whose provider does not implement its own vector cache.
+            pending = selected
+            if remote:
+                prepared = set(self.vectors.prepared_metadata_ids(selected, self.dataset_hash))
+                pending = [record for record in selected if record["item_id"] not in prepared]
+            if pending:
+                pending_sources = sorted({self.catalog.get(record["item_id"]).get("source_id", "") for record in pending})
+                with self._embedding_context([{"kind": "metadata", "source_id": source,
+                        "version_id": self.dataset_hash, "actor": actor} for source in pending_sources]):
+                    self.vectors.index_metadata(pending, dataset_hash=self.dataset_hash,
+                        replace=not remote and item_ids is None)
+            state = self._metadata_state([record["item_id"] for record in selected] if item_ids is not None else None)
+        return {"status": "META_READY", **state, "selected_metadata_count": len(selected),
+            "item_ids": [record["item_id"] for record in selected], "dataset_hash": self.dataset_hash,
+            "embedding_model": self.vectors.embeddings.name}
 
     def _run_model(self, kind, variables, actor, item_id):
         contextualize = getattr(self.model, "processing_context", None)
@@ -138,7 +172,8 @@ class RagService:
             with read_guard() if callable(read_guard) else nullcontext():
                 yield
 
-    def corpus_summary(self):
+    def corpus_summary(self, item_ids=None):
+        metadata = self._metadata_state(item_ids)
         with closing(self.db.connect()) as connection:
             rows = connection.execute("SELECT v.body_hash,v.version_id,d.document_id,d.review_json FROM document_versions v JOIN documents d ON d.document_id=v.document_id").fetchall()
         official, synthetic = [], []
@@ -146,12 +181,13 @@ class RagService:
             (synthetic if json.loads(row["review_json"]).get("is_synthetic", False) else official).append(dict(row))
         manifest = self._active()
         chunks = self.vectors.docs.get(where={"revision": manifest["revision"]}, include=["metadatas"])["metadatas"] if manifest else []
-        return {"metadata_count": self.vectors.meta.count(), "revision": manifest["revision"] if manifest else None,
+        return {**metadata, "revision": manifest["revision"] if manifest else None,
+            "active_index": {key: manifest[key] for key in ("revision", "embedding_model", "dimension", "dataset_hash")} if manifest else None,
             "official_document_body_count": len({row["body_hash"] for row in official}),
             "official_document_version_count": len(official), "synthetic_document_body_count": len({row["body_hash"] for row in synthetic}),
             "official_document_chunk_count": sum(row["source_type"] == "official_document" for row in chunks),
             "synthetic_document_chunk_count": sum(row["source_type"] == "synthetic_document" for row in chunks),
-            "embedding_model": self.vectors.embeddings.name}
+            "embedding_model": self.vectors.embeddings.name, "embedding_dimension": self.vectors.embeddings.dimension}
 
     def _build_graph(self):
         try:
@@ -284,9 +320,12 @@ class RagService:
                 self.registry.policy.require_capability(actor, "DATA_MANAGER")
                 if self.vectors.embeddings.is_remote and not self.settings.remote_models:
                     raise ServiceError("MODEL_REMOTE_BLOCKED", "Remote embeddings are disabled.", 503, False)
-                if self.vectors.embeddings.is_remote and self.metadata_count != len(self._metadata_records):
-                    raise ServiceError("INDEX_EMPTY", "Prepare the metadata index before document embeddings.", 409, False)
+                prepared_metadata = set(self.vectors.prepared_metadata_ids(self._metadata_records, self.dataset_hash))
+                if self.vectors.embeddings.is_remote and item_id not in prepared_metadata:
+                    raise ServiceError("INDEX_EMPTY", "Prepare this item's metadata before document embeddings.", 409, False)
                 candidates = self.registry.candidates()
+                if self.vectors.embeddings.is_remote:
+                    candidates = [candidate for candidate in candidates if candidate["item_id"] in prepared_metadata]
                 chunks = []
                 versions = []
                 update(stage="PARSING_STORED_BODIES")
@@ -515,6 +554,8 @@ class RagService:
         if self.vectors.embeddings.is_remote:
             if not self.settings.remote_models:
                 raise ServiceError("MODEL_REMOTE_BLOCKED", "Remote embeddings are disabled.", 503, False)
+            if not self.vectors.metadata_matches(self._metadata_selection([state["item_id"]]), self.dataset_hash, exact=False):
+                raise ServiceError("INDEX_EMPTY", "The selected item's metadata index is not ready.", 409, False)
             self.registry._require(item.get("source_id", ""), "external_process", state["user_id"], self.dataset_hash)
             for candidate in usable:
                 self.registry._require(candidate["source_id"], "external_process", state["user_id"], candidate["version_id"])

@@ -193,7 +193,7 @@ class CollectionFlowTests(unittest.TestCase):
             model=self.model, embeddings=embedding, prompt_store=fixtures.SyntheticPromptStore(), source_policy=self.policy, index_actor="manager")
         self.addCleanup(remote.close)
         self.assertEqual(embedding.seen, [])
-        remote.prepare_metadata("manager")
+        remote.prepare_metadata("manager", item_ids=[self.item])
         self.rag = remote
         self.configure()
         self.target()

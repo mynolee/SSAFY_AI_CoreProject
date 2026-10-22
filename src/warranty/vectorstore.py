@@ -64,33 +64,68 @@ class LocalVectorStore:
         self.docs = self.client.get_or_create_collection("warranty_docs" + suffix,
             metadata={"hnsw:space": "cosine", "embedding_model": self.embeddings.name}, embedding_function=None)
 
-    def metadata_matches(self, records: list[dict[str, Any]], dataset_hash: str) -> bool:
-        """Check a prepared catalog without invoking an embedding provider."""
-        expected = {str(record["item_id"]): record["text"] for record in records}
-        if len(expected) != len(records) or self.meta.count() != len(expected):
-            return False
-        rows = self.meta.get(include=["documents", "metadatas"])
-        actual = {key: (text, metadata) for key, text, metadata in
-                  zip(rows["ids"], rows["documents"], rows["metadatas"])}
-        return set(actual) == set(expected) and all(
-            actual[key][0] == text and actual[key][1].get("dataset_hash") == dataset_hash
-            for key, text in expected.items())
-
-    def index_metadata(self, records: list[dict[str, Any]], dataset_hash: str | None = None) -> int:
-        ids = [str(record["item_id"]) for record in records]
+    @staticmethod
+    def _metadata_inputs(records):
+        if not isinstance(records, list) or any(
+            not isinstance(record, dict) or not isinstance(record.get("item_id"), str)
+            or not record["item_id"].strip() or len(record["item_id"]) > 256
+            or not isinstance(record.get("text"), str) or not record["text"].strip()
+            for record in records
+        ):
+            raise ServiceError("INVALID_INPUT", "Invalid metadata input.", 422, False)
+        ids = [record["item_id"] for record in records]
         if len(ids) != len(set(ids)):
             raise ServiceError("MODEL_OUTPUT_INVALID", "Duplicate catalog identity.", 409, False)
+        return ids
+
+    def prepared_metadata_ids(self, records: list[dict[str, Any]], dataset_hash: str) -> list[str]:
+        """Read identities whose full text and dataset binding still match."""
+        try:
+            ids = self._metadata_inputs(records)
+        except ServiceError:
+            return []
+        if not ids or not isinstance(dataset_hash, str) or not dataset_hash:
+            return []
+        rows = self.meta.get(ids=ids, include=["documents", "metadatas"])
+        actual = {key: (text, metadata) for key, text, metadata in
+                  zip(rows["ids"], rows["documents"], rows["metadatas"])}
+        return [record["item_id"] for record in records
+            if record["item_id"] in actual
+            and actual[record["item_id"]][0] == record["text"]
+            and isinstance(actual[record["item_id"]][1], dict)
+            and actual[record["item_id"]][1].get("dataset_hash") == dataset_hash
+            and actual[record["item_id"]][1].get("item_id") == record["item_id"]
+            and actual[record["item_id"]][1].get("source_type") == "metadata"]
+
+    def metadata_matches(self, records: list[dict[str, Any]], dataset_hash: str, *, exact=True) -> bool:
+        """Read prepared metadata; exact=False checks an explicit subset."""
+        try:
+            ids = self._metadata_inputs(records)
+        except ServiceError:
+            return False
+        return (isinstance(dataset_hash, str) and bool(dataset_hash)
+            and (not exact or self.meta.count() == len(ids))
+            and self.prepared_metadata_ids(records, dataset_hash) == ids)
+
+    def index_metadata(self, records: list[dict[str, Any]], dataset_hash: str | None = None,
+                       *, replace=True) -> int:
+        ids = self._metadata_inputs(records)
+        if type(replace) is not bool or (dataset_hash is not None and
+                (not isinstance(dataset_hash, str) or not dataset_hash)):
+            raise ServiceError("INVALID_INPUT", "Invalid metadata indexing settings.", 422, False)
         if records:
             texts = [record["text"] for record in records]
             self.meta.upsert(ids=ids, documents=texts, embeddings=self.embeddings.embed(texts),
                 metadatas=[{"item_id": value, "source_type": "metadata",
                             **({"dataset_hash": dataset_hash} if dataset_hash is not None else {})}
                            for value in ids])
-        old_ids = self.meta.get(include=[])['ids']
-        stale = [value for value in old_ids if value not in set(ids)]
-        if stale:
-            self.meta.delete(ids=stale)
-        if self.meta.count() != len(ids):
+        if replace:
+            old_ids = self.meta.get(include=[])['ids']
+            stale = [value for value in old_ids if value not in set(ids)]
+            if stale:
+                self.meta.delete(ids=stale)
+        if (replace and self.meta.count() != len(ids)) or (dataset_hash is not None and
+                not self.metadata_matches(records, dataset_hash, exact=replace)):
             raise ServiceError("INDEX_EMPTY", "Metadata index validation failed.", 503, True)
         return self.meta.count()
 
