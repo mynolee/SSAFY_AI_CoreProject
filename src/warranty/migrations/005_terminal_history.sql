@@ -1,0 +1,4 @@
+CREATE TRIGGER operation_terminal_guard BEFORE UPDATE ON settlement_operations WHEN OLD.status IN ('SUCCEEDED','CANCELLED') AND NEW.status!=OLD.status BEGIN SELECT RAISE(ABORT,'terminal operation cannot be revived or rewritten'); END;
+CREATE TRIGGER simulation_event_identity_guard BEFORE UPDATE ON simulation_events WHEN NEW.event_id!=OLD.event_id OR NEW.operation_id!=OLD.operation_id OR NEW.attempt_no!=OLD.attempt_no OR NEW.outcome!=OLD.outcome OR NEW.created_at!=OLD.created_at OR NEW.applied<OLD.applied BEGIN SELECT RAISE(ABORT,'trusted simulation event is immutable'); END;
+CREATE TRIGGER simulation_event_no_delete BEFORE DELETE ON simulation_events BEGIN SELECT RAISE(ABORT,'trusted simulation event history is immutable'); END;
+CREATE TRIGGER idempotency_no_update BEFORE UPDATE ON idempotency_records BEGIN SELECT RAISE(ABORT,'idempotency result is immutable'); END;
