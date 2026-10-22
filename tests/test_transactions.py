@@ -1,5 +1,6 @@
 """Synthetic settlement regression tests; no real money, documents or uploads."""
 import concurrent.futures
+import json
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -8,7 +9,7 @@ import uuid
 
 from warranty.db import Database
 from warranty.errors import ServiceError
-from warranty.transactions import TradeService, verify_accounting
+from warranty.transactions import TradeService, canonical, digest, verify_accounting
 from warranty.worker import SettlementWorker
 
 
@@ -436,6 +437,209 @@ class TransactionsTest(unittest.TestCase):
         self.assertFalse(current["receipt"]["received"])
         self.assertEqual(800000, current["balances"]["D"]["held"])
         self.assertEqual(80000, current["balances"]["W"]["held"])
+
+    def test_public_review_and_legacy_replay_omit_private_source_and_generated_text(self):
+        private_text = {"excerpt": "SYNTHETIC_PRIVATE_EXCERPT_92",
+                        "answer": "SYNTHETIC_PRIVATE_ANSWER_93",
+                        "claim": "SYNTHETIC_PRIVATE_CLAIM_94",
+                        "condition": "SYNTHETIC_PRIVATE_CONDITION_95"}
+        review = verified_review("buyer", "SYNTHETIC:item", "SYNTHETIC:review")
+        review.update({"answer": private_text["answer"],
+                       "claims": [{"text": private_text["claim"]}],
+                       "conditions": [{"condition": private_text["condition"]}],
+                       "evidence": [{"evidence_id": "SYNTHETIC:evidence-id",
+                                     "document_id": "SYNTHETIC:document-id",
+                                     "version_id": "SYNTHETIC:version-id",
+                                     "text": private_text["excerpt"],
+                                     "title": private_text["claim"]}],
+                       "document_hashes": ["a" * 64]})
+        self.service.review_validator = lambda actor, item_id, review_id: review
+        trade = self.fund()
+        version = trade["version"]
+        payload = {"review_id": "SYNTHETIC:review"}
+        adopted = self.call(trade, "adopt_review", payload, key="adopt-private-review", version=version)
+        fetched = self.service.get("seller", trade["trade_id"])
+        replayed = self.service.mutate("buyer", trade["trade_id"], "adopt_review", payload, "adopt-private-review", version)
+        for response in (adopted, fetched, replayed):
+            encoded = canonical(response)
+            for value in private_text.values():
+                self.assertNotIn(value, encoded)
+            projected = response["review"]
+            self.assertEqual("TRANSFERABLE", projected["classification"])
+            self.assertEqual(1, projected["applicability_ok"])
+            self.assertEqual(["SYNTHETIC:evidence-id"], projected["evidence_ids"])
+            self.assertEqual(["SYNTHETIC:document-id"], projected["document_ids"])
+            self.assertEqual(["SYNTHETIC:version-id"], projected["document_version_ids"])
+            self.assertEqual(["a" * 64], projected["document_hashes"])
+            self.assertFalse({"snapshot", "payload_json", "answer", "evidence", "claims", "conditions"} & set(projected))
+        with self.db.connect() as conn:
+            stored = dict(conn.execute("SELECT * FROM review_snapshots WHERE review_id=?", (adopted["review_id"],)).fetchone())
+        self.assertEqual(review, json.loads(stored["payload_json"]))
+        legacy = dict(adopted)
+        legacy["review"] = {**stored, "snapshot": review}
+        legacy_payload = {"contract_revision": adopted["contract_revision"]}
+        legacy_version = 1
+        request_hash = digest({"actor": "buyer", "action": "receipt", "trade_id": trade["trade_id"],
+                               "payload": legacy_payload, "expected_version": legacy_version})
+        with self.db.transaction() as conn:
+            conn.execute("INSERT INTO idempotency_records(actor,scope,key,request_hash,response_json) VALUES('buyer','receipt',?,?,?)",
+                         ("legacy-private-review", request_hash, canonical(legacy)))
+        legacy_replay = self.service.mutate("buyer", trade["trade_id"], "receipt", legacy_payload,
+                                           "legacy-private-review", legacy_version)
+        self.assertEqual(adopted, legacy_replay)
+        for value in private_text.values():
+            self.assertNotIn(value, canonical(legacy_replay))
+        with self.db.connect() as conn:
+            retained = conn.execute("SELECT payload_json FROM review_snapshots WHERE review_id=?", (adopted["review_id"],)).fetchone()[0]
+            retained_cache = conn.execute("SELECT response_json FROM idempotency_records WHERE key='legacy-private-review'").fetchone()[0]
+        self.assertEqual(stored["payload_json"], retained)
+        self.assertEqual(canonical(legacy), retained_cache)
+
+    @staticmethod
+    def conditional_review():
+        review = verified_review("buyer", "SYNTHETIC:item", "SYNTHETIC:conditional")
+        review.update({"classification": "CONDITIONAL", "conditions_ok": True,
+                       "conditions": [
+                           {"text": "SYNTHETIC private clause: first required procedure",
+                            "evidence_ids": ["SYNTHETIC:terms"], "condition_id": "model-forged-first"},
+                           {"text": "SYNTHETIC private clause: second required procedure",
+                            "evidence_ids": ["SYNTHETIC:terms"], "condition_id": "model-forged-second"}],
+                       "required_condition_ids": ["model-forged-first", "model-forged-second"]})
+        return review
+
+    def conditional_trade(self, review=None):
+        review = self.conditional_review() if review is None else review
+        self.service.review_validator = lambda actor, item_id, review_id: review
+        trade = self.call(self.fund(), "adopt_review", {"review_id": "SYNTHETIC:conditional"})
+        self.consent_contract(trade)
+        return self.call(trade, "receipt", {"contract_revision": trade["contract_revision"]})
+
+    def checked_evidence(self, trade, checks=None, both=True):
+        payload = {"references": ["SYNTHETIC:conditional-proof"]}
+        if checks is not None:
+            payload["condition_checks"] = checks
+        trade = self.call(trade, "evidence", payload)
+        evidence = trade["evidence"]
+        confirmation = {"evidence_id": evidence["evidence_id"], "hash": evidence["hash"]}
+        self.call(trade, "confirm_evidence", confirmation)
+        if both:
+            trade = self.call(trade, "confirm_evidence", confirmation, "seller")
+        return trade
+
+    def assert_no_new_reservation(self, trade, proposal, code):
+        before = self.assert_accounts(trade)
+        self.assert_code(code, lambda: self.reserve(trade, proposal))
+        after = self.assert_accounts(trade)
+        self.assertEqual(before["operations"], after["operations"])
+        self.assertEqual(before["groups"], after["groups"])
+        self.assertEqual(before["ledger"], after["ledger"])
+        self.assertEqual(before["balances"], after["balances"])
+
+    def test_conditional_missing_and_false_attestations_cannot_reserve(self):
+        trade = self.conditional_trade()
+        self.assertEqual(0, trade["review"]["conditions_ok"])
+        required = trade["review"]["required_condition_ids"]
+        self.assertEqual(2, len(required))
+        self.assertTrue(all(value.startswith("condition-") for value in required))
+        self.assertNotIn("model-forged-first", required)
+        with self.db.connect() as conn:
+            normalized = json.loads(conn.execute("SELECT payload_json FROM review_snapshots WHERE review_id=?", (trade["review_id"],)).fetchone()[0])
+        self.assertEqual(required, sorted(condition["condition_id"] for condition in normalized["conditions"]))
+        self.assertFalse(normalized["conditions_ok"])
+        trade = self.checked_evidence(trade)
+        trade, proposal = self.proposal(trade, [{"component": "W", "pay_won": 80000, "refund_won": 0}])
+        self.assert_no_new_reservation(trade, proposal, "W_CONDITIONS_NOT_CONFIRMED")
+        checks = [{"condition_id": value, "confirmed": index != 0} for index, value in enumerate(required)]
+        trade = self.checked_evidence(trade, checks)
+        trade, proposal = self.proposal(trade, [{"component": "W", "pay_won": 80000, "refund_won": 0}])
+        self.assert_no_new_reservation(trade, proposal, "W_CONDITIONS_NOT_CONFIRMED")
+
+    def test_condition_checks_reject_foreign_duplicate_missing_and_nonboolean_values(self):
+        trade = self.conditional_trade()
+        required = trade["review"]["required_condition_ids"]
+        good = [{"condition_id": value, "confirmed": True} for value in required]
+        invalid = [good + [{"condition_id": "condition-" + "f" * 64, "confirmed": True}],
+                   good + [good[0]], good[:-1], [],
+                   [{**good[0], "confirmed": 1}, good[1]],
+                   [{**good[0], "confirmed": "true"}, good[1]],
+                   [{**good[0], "unexpected": True}, good[1]]]
+        for checks in invalid:
+            with self.subTest(checks=checks):
+                before = self.assert_accounts(trade)
+                self.assert_code("INVALID_CONDITION_CHECKS", lambda: self.call(trade, "evidence", {
+                    "references": ["SYNTHETIC:bad-conditional-proof"], "condition_checks": checks}))
+                after = self.assert_accounts(trade)
+                self.assertEqual(before["version"], after["version"])
+                self.assertEqual(before["evidence"], after["evidence"])
+                self.assertEqual(before["balances"], after["balances"])
+                self.assertEqual(before["ledger"], after["ledger"])
+                self.assertEqual([], after["operations"])
+
+    def test_conditional_all_checks_require_bilateral_latest_bundle_then_pay(self):
+        trade = self.conditional_trade()
+        required = trade["review"]["required_condition_ids"]
+        checks = [{"condition_id": value, "confirmed": True} for value in required]
+        trade = self.checked_evidence(trade, checks, both=False)
+        evidence = trade["evidence"]
+        self.assertEqual(checks, evidence["content"]["condition_checks"])
+        trade, proposal = self.proposal(trade, [{"component": "W", "pay_won": 80000, "refund_won": 0}])
+        self.assert_no_new_reservation(trade, proposal, "W_BILATERAL_EVIDENCE_REQUIRED")
+        self.call(trade, "confirm_evidence", {"evidence_id": evidence["evidence_id"], "hash": evidence["hash"]}, "seller")
+        self.reserve(trade, proposal)
+        self.service.run_pending()
+        current = self.assert_accounts(trade)
+        self.assertEqual(80000, current["balances"]["W"]["paid"])
+        for condition in self.conditional_review()["conditions"]:
+            self.assertNotIn(condition["text"], canonical(current))
+        self.assertEqual(required, current["review"]["required_condition_ids"])
+
+    def test_empty_or_inconsistent_conditional_definitions_never_pass_vacuously(self):
+        cases = []
+        empty = self.conditional_review()
+        empty["conditions"] = []
+        cases.append(empty)
+        foreign_evidence = self.conditional_review()
+        foreign_evidence["conditions"][0]["evidence_ids"] = ["SYNTHETIC:other-evidence"]
+        cases.append(foreign_evidence)
+        inconsistent = self.conditional_review()
+        inconsistent["classification"] = "TRANSFERABLE"
+        cases.append(inconsistent)
+        for review in cases:
+            with self.subTest(classification=review["classification"], conditions=review["conditions"]):
+                # Keep one wallet-independent transaction per definition case.
+                trade = self.conditional_trade(review)
+                self.assertEqual([], trade["review"]["required_condition_ids"])
+                trade = self.checked_evidence(trade)
+                trade, proposal = self.proposal(trade, [{"component": "W", "pay_won": 80000, "refund_won": 0}])
+                self.assert_no_new_reservation(trade, proposal, "W_REQUIRED_CONDITIONS_MISSING")
+                # Return this synthetic deposit so all cases can share the demo wallet.
+                refund, refund_proposal = self.proposal(trade, [
+                    {"component": "D", "pay_won": 0, "refund_won": 800000},
+                    {"component": "W", "pay_won": 0, "refund_won": 80000}], "mutual_agreement")
+                self.reserve(refund, refund_proposal)
+                self.service.run_pending()
+
+    def test_legacy_conditional_true_flag_still_needs_exact_human_attestations(self):
+        trade = self.fund()
+        legacy = self.conditional_review()
+        with self.db.transaction() as conn:
+            review_id = "SYNTHETIC:legacy-condition-review"
+            conn.execute("INSERT INTO review_snapshots(review_id,trade_id,revision,hash,classification,applicability_ok,conditions_ok,payload_json) VALUES(?,?,1,?,'CONDITIONAL',1,1,?)",
+                         (review_id, trade["trade_id"], digest(legacy), canonical(legacy)))
+            body = {"item_id": trade["item_id"], "revision": 2, "D": 800000, "W": 80000,
+                    "terms": trade["contract"]["terms"], "review_id": review_id}
+            conn.execute("INSERT INTO contract_revisions(trade_id,revision,hash,item_id,D,W,terms_json,review_id) VALUES(?,2,?,?,800000,80000,?,?)",
+                         (trade["trade_id"], digest(body), trade["item_id"], canonical(body["terms"]), review_id))
+            conn.execute("UPDATE trades SET contract_revision=2,review_id=?,receipt_revision=NULL,version=version+1 WHERE trade_id=?", (review_id, trade["trade_id"]))
+        trade = self.consent_contract(trade)
+        trade = self.call(trade, "receipt", {"contract_revision": 2})
+        self.assertEqual(0, trade["review"]["conditions_ok"])
+        self.assertEqual(2, len(trade["review"]["required_condition_ids"]))
+        trade = self.checked_evidence(trade)
+        trade, proposal = self.proposal(trade, [{"component": "W", "pay_won": 80000, "refund_won": 0}])
+        self.assert_no_new_reservation(trade, proposal, "W_CONDITIONS_NOT_CONFIRMED")
+        with self.db.connect() as conn:
+            self.assertEqual(1, conn.execute("SELECT conditions_ok FROM review_snapshots WHERE review_id=?", (review_id,)).fetchone()[0])
 
 
 if __name__ == "__main__":

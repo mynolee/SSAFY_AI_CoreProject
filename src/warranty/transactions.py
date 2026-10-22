@@ -38,6 +38,118 @@ def rowdict(row):
     return dict(row) if row is not None else None
 
 
+def review_condition_ids(snapshot):
+    """Derive required IDs from server-stored clauses, never supplied ID fields.
+
+    None means the conditional definition is incomplete or inconsistent. An
+    unconditional review has no required clauses and returns an empty list.
+    """
+    if not isinstance(snapshot, dict):
+        return None
+    conditions = snapshot.get("conditions", [])
+    if snapshot.get("classification") != "CONDITIONAL":
+        return [] if not conditions else None
+    if not isinstance(conditions, list) or not conditions or len(conditions) > 100:
+        return None
+    evidence = snapshot.get("evidence", [])
+    if not isinstance(evidence, list):
+        return None
+    known_ids = {entry.get("evidence_id", entry.get("id")) for entry in evidence
+                 if isinstance(entry, dict) and entry.get("source_type") != "metadata"
+                 and isinstance(entry.get("evidence_id", entry.get("id")), str)}
+    required = []
+    for condition in conditions:
+        if not isinstance(condition, dict):
+            return None
+        text, evidence_ids = condition.get("text"), condition.get("evidence_ids")
+        if (not isinstance(text, str) or not text.strip() or len(text) > 10000 or
+                not isinstance(evidence_ids, list) or not evidence_ids or
+                any(not isinstance(value, str) or value not in known_ids for value in evidence_ids) or
+                len(set(evidence_ids)) != len(evidence_ids)):
+            return None
+        condition_id = "condition-" + digest({"text": text, "evidence_ids": sorted(evidence_ids)})
+        if condition_id in required:
+            return None
+        required.append(condition_id)
+    return sorted(required)
+
+
+def condition_checks(values, required, *, exact=True):
+    """Validate explicit party attestations; false is data, never a default true."""
+    if not isinstance(values, list) or len(values) > 100:
+        fail("INVALID_CONDITION_CHECKS", "Condition checks must be an explicit list.", 400)
+    checks = {}
+    for check in values:
+        if (not isinstance(check, dict) or set(check) != {"condition_id", "confirmed"} or
+                not isinstance(check.get("condition_id"), str) or type(check.get("confirmed")) is not bool or
+                check["condition_id"] in checks or check["condition_id"] not in required):
+            fail("INVALID_CONDITION_CHECKS", "Use each required condition ID once with an explicit boolean.", 400)
+        checks[check["condition_id"]] = check["confirmed"]
+    if exact and set(checks) != set(required):
+        fail("INVALID_CONDITION_CHECKS", "Condition checks must identify the exact required conditions.", 400)
+    return [{"condition_id": key, "confirmed": checks[key]} for key in sorted(checks)]
+
+
+def public_review(review):
+    """Project immutable private reviews without redisplaying source excerpts.
+
+    This pure projection also handles pre-existing idempotency responses. Source
+    permissions may change after adoption; source text and generated prose are
+    therefore never part of the transaction service's public review DTO.
+    """
+    if not isinstance(review, dict):
+        return None
+    result = {key: review[key] for key in ("review_id", "trade_id", "revision", "hash",
+              "classification", "applicability_ok", "conditions_ok", "created_at") if key in review}
+    if result.get("classification") == "CONDITIONAL":
+        result["conditions_ok"] = 0
+    snapshot = review.get("snapshot")
+    if not isinstance(snapshot, dict):
+        try:
+            snapshot = json.loads(review.get("payload_json", "{}"))
+        except (TypeError, ValueError):
+            snapshot = {}
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+    values = {}
+    for field in ("document_ids", "document_version_ids", "document_hashes", "evidence_ids"):
+        values[field] = set()
+        for source in (review, snapshot):
+            entries = source.get(field, [])
+            if isinstance(entries, list):
+                values[field].update(value for value in entries if isinstance(value, str))
+    evidence = snapshot.get("evidence", [])
+    if isinstance(evidence, list):
+        for entry in evidence:
+            if not isinstance(entry, dict):
+                continue
+            for field, keys in (("document_ids", ("document_id",)),
+                                ("document_version_ids", ("document_version_id", "version_id")),
+                                ("evidence_ids", ("evidence_id", "id"))):
+                for key in keys:
+                    if isinstance(entry.get(key), str):
+                        values[field].add(entry[key])
+    if "conditions" in snapshot or snapshot.get("classification") == "CONDITIONAL":
+        required = review_condition_ids(snapshot) or []
+    else:
+        # A newer cached response already contains only this server-derived DTO.
+        required = review.get("required_condition_ids", [])
+        if not isinstance(required, list):
+            required = []
+        required = sorted({value for value in required if isinstance(value, str)
+                           and value.startswith("condition-") and len(value) == 74
+                           and all(c in "0123456789abcdef" for c in value[10:])})
+    result["required_condition_ids"] = required
+    return {**result, **{key: sorted(entries) for key, entries in values.items()}}
+
+
+def public_trade_response(response):
+    """Apply current disclosure rules to freshly built and cached trade views."""
+    projected = dict(response)
+    projected["review"] = public_review(response.get("review"))
+    return projected
+
+
 def post_ledger(conn, trade_id, event_type, amount, debit, credit, operation_id=None, attempt_no=1):
     """Create and seal a balanced append-only journal inside the caller transaction."""
     group_id = identifier()
@@ -191,8 +303,7 @@ class TradeService:
         trade["contract_consents"] = [dict(r) for r in conn.execute("SELECT * FROM consents WHERE trade_id=? AND target_type='contract' AND revision=?", (trade_id, trade["contract_revision"]))]
         trade["receipt"] = {"received": trade["receipt_revision"] == trade["contract_revision"], "contract_revision": trade["receipt_revision"]}
         trade["review"] = rowdict(conn.execute("SELECT * FROM review_snapshots WHERE trade_id=? AND review_id=?", (trade_id, trade["review_id"])).fetchone())
-        if trade["review"]:
-            trade["review"]["snapshot"] = json.loads(trade["review"].pop("payload_json"))
+        trade["review"] = public_review(trade["review"])
         trade["evidence"] = rowdict(conn.execute("SELECT * FROM evidence_bundles WHERE trade_id=? AND evidence_id=?", (trade_id, trade["evidence_id"])).fetchone())
         if trade["evidence"]:
             trade["evidence"]["content"] = json.loads(trade["evidence"].pop("payload_json"))
@@ -223,7 +334,7 @@ class TradeService:
     _FIELDS = {
         "contract": {"D", "W", "terms"}, "contract_consent": {"revision", "hash"},
         "deposit": set(), "receipt": {"contract_revision"}, "adopt_review": {"review_id"},
-        "evidence": {"references", "description"}, "confirm_evidence": {"evidence_id", "hash"},
+        "evidence": {"references", "description", "condition_checks"}, "confirm_evidence": {"evidence_id", "hash"},
         "proposal": {"allocations", "review_id", "evidence_id", "refund_reason"},
         "proposal_consent": {"proposal_id", "revision", "hash"}, "reserve": {"proposal_id", "revision"},
         "retry": {"operation_id"}, "reconcile": {"operation_id"}, "dispute": {"scope"},
@@ -259,7 +370,7 @@ class TradeService:
             if previous:
                 if previous["request_hash"] != request_hash:
                     fail("IDEMPOTENCY_CONFLICT", "This key was already used for a different request.", 409)
-                return json.loads(previous["response_json"])
+                return public_trade_response(json.loads(previous["response_json"]))
             # A new key for the same logical allocation must find it before the version guard.
             if action == "reserve":
                 proposal = self._proposal(conn, trade, payload.get("proposal_id"))
@@ -395,6 +506,15 @@ class TradeService:
             classification = review.get("classification", "NEEDS_INFORMATION")
             if classification not in ("TRANSFERABLE", "CONDITIONAL", "NOT_TRANSFERABLE", "NEEDS_INFORMATION"):
                 fail("INVALID_REVIEW")
+            if classification == "CONDITIONAL":
+                # The model discovers clauses; only bilateral evidence can
+                # attest fulfilment. Even a legacy true flag has no authority.
+                review["conditions_ok"] = False
+                review["required_condition_ids"] = review_condition_ids(review) or []
+                if review["required_condition_ids"]:
+                    review["conditions"] = [{**condition, "condition_id": "condition-" + digest({
+                        "text": condition["text"], "evidence_ids": sorted(condition["evidence_ids"])})}
+                        for condition in review["conditions"]]
             rid = identifier()
             revision = conn.execute("SELECT COALESCE(MAX(revision),0)+1 FROM review_snapshots WHERE trade_id=?", (tid,)).fetchone()[0]
             conn.execute("INSERT INTO review_snapshots(review_id,trade_id,revision,hash,classification,applicability_ok,conditions_ok,payload_json) VALUES(?,?,?,?,?,?,?,?)", (rid, tid, revision, digest(review), classification, int(review.get("applicability_ok") is True), int(review.get("conditions_ok") is True), canonical(review)))
@@ -413,9 +533,15 @@ class TradeService:
                 fail("SYNTHETIC_EVIDENCE_ONLY", "Only labelled synthetic evidence references are enabled.", 400)
             if payload.get("description") is not None and (not isinstance(payload["description"], str) or len(payload["description"]) > 2000):
                 fail("INVALID_EVIDENCE", status=400)
+            review_row = conn.execute("SELECT payload_json FROM review_snapshots WHERE trade_id=? AND review_id=?", (tid, trade["review_id"])).fetchone()
+            snapshot = json.loads(review_row[0]) if review_row else {}
+            required = review_condition_ids(snapshot) or []
+            checks = condition_checks(payload.get("condition_checks", []), required,
+                                      exact="condition_checks" in payload)
             eid = identifier()
             revision = conn.execute("SELECT COALESCE(MAX(revision),0)+1 FROM evidence_bundles WHERE trade_id=?", (tid,)).fetchone()[0]
-            body = {"references": refs, "description": payload.get("description"), "contract_revision": contract["revision"], "review_id": trade["review_id"], "synthetic": True}
+            body = {"references": refs, "description": payload.get("description"), "condition_checks": checks,
+                    "contract_revision": contract["revision"], "review_id": trade["review_id"], "synthetic": True}
             conn.execute("INSERT INTO evidence_bundles(evidence_id,trade_id,revision,hash,contract_revision,review_id,payload_json) VALUES(?,?,?,?,?,?,?)", (eid, tid, revision, digest(body), contract["revision"], trade["review_id"], canonical(body)))
             conn.execute("UPDATE trades SET evidence_id=?,status=CASE WHEN funded=1 THEN 'ACTIVE' ELSE status END WHERE trade_id=?", (eid, tid))
         elif action == "confirm_evidence":
@@ -626,13 +752,24 @@ class TradeService:
                 if review is None or review["classification"] not in ("TRANSFERABLE", "CONDITIONAL") or not review["applicability_ok"]:
                     fail("W_REVIEW_NOT_READY")
                 snapshot = json.loads(review["payload_json"])
-                if snapshot.get("missing_information") or snapshot.get("conflicts") or not snapshot.get("evidence") or not snapshot.get("document_hashes"):
+                if snapshot.get("classification") != review["classification"] or snapshot.get("missing_information") or snapshot.get("conflicts") or not snapshot.get("evidence") or not snapshot.get("document_hashes"):
                     fail("W_REVIEW_NOT_READY")
-                if review["classification"] == "CONDITIONAL" and not review["conditions_ok"]:
-                    fail("W_CONDITIONS_NOT_CONFIRMED")
+                required = review_condition_ids(snapshot)
+                if required is None:
+                    fail("W_REQUIRED_CONDITIONS_MISSING", "Valid document-supported condition definitions are required.")
                 evidence = conn.execute("SELECT * FROM evidence_bundles WHERE trade_id=? AND evidence_id=?", (tid, proposal["evidence_id"])).fetchone()
                 if evidence is None or evidence["evidence_id"] != trade["evidence_id"] or evidence["review_id"] != review["review_id"] or evidence["contract_revision"] != contract["revision"]:
                     fail("W_EVIDENCE_NOT_READY")
+                if review["classification"] == "CONDITIONAL":
+                    if not required:
+                        fail("W_REQUIRED_CONDITIONS_MISSING")
+                    checks = json.loads(evidence["payload_json"]).get("condition_checks", [])
+                    try:
+                        checks = condition_checks(checks, required)
+                    except ServiceError:
+                        fail("W_CONDITIONS_NOT_CONFIRMED", "Both parties must confirm evidence for every required condition.")
+                    if not all(check["confirmed"] is True for check in checks):
+                        fail("W_CONDITIONS_NOT_CONFIRMED", "Both parties must confirm evidence for every required condition.")
                 actors = {r[0] for r in conn.execute("SELECT actor FROM evidence_confirmations WHERE trade_id=? AND evidence_id=? AND target_hash=?", (tid, evidence["evidence_id"], evidence["hash"]))}
                 if not {trade["buyer_id"], trade["seller_id"]}.issubset(actors):
                     fail("W_BILATERAL_EVIDENCE_REQUIRED")
