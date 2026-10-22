@@ -288,6 +288,15 @@ class DocumentRegistry:
             self._manager(actor)
             for action in ("store_body", "extract"):
                 self._require(row["source_id"], action, actor, version_id)
+            # Diagnose an immutable contract conflict before replacing the body
+            # file. The write-transaction check below still fences concurrent
+            # inserts from other application or policy instances.
+            with closing(self.db.connect()) as connection:
+                existing = connection.execute("SELECT * FROM document_versions WHERE document_id=? AND body_hash=?",
+                    (document_id, body_hash)).fetchone()
+            if existing is not None and (json.loads(existing["applicability_json"]) != applicability
+                    or existing["published_on"] != published_on or existing["source_version_note"] != source_version_note):
+                raise ServiceError("DOCUMENT_VERSION_CONFLICT", "Existing document text has different immutable contract scope; register a separately identified document.", 409, False)
             temporary = None
             try:
                 with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.body_dir, suffix=".tmp", delete=False) as output:
