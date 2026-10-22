@@ -865,8 +865,8 @@ class RagService:
         documents = []
         for candidate in candidates:
             try:
-                self.registry._require(candidate["source_id"], "local_embed", version_id=candidate["version_id"])
-                self.registry._require(candidate["source_id"], "display_excerpt", version_id=candidate["version_id"])
+                self.registry._require(candidate["source_id"], "local_embed", user_id, candidate["version_id"])
+                self.registry._require(candidate["source_id"], "display_excerpt", user_id, candidate["version_id"])
             except ServiceError:
                 continue
             if (candidate["version_id"] not in versions or

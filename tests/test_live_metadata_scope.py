@@ -13,6 +13,7 @@ from warranty.db import Database
 from warranty.documents import digest
 from warranty.errors import ServiceError
 from warranty.rag import RagService
+from warranty.security import SourcePolicy
 from warranty.vectorstore import MockEmbeddings
 
 
@@ -222,6 +223,39 @@ class LiveMetadataScopeTests(unittest.TestCase):
         self.assertEqual(result["metadata_count"], 104)
         self.assertTrue(result["metadata_complete"])
         self.assertTrue(result["metadata_index_matches"])
+
+    def test_strict_actor_checklist_preserves_authorized_documents_and_denies_other_actors(self):
+        reviews = []
+        buyer_actions = {"view_link", "local_embed", "display_excerpt", "external_process"}
+        for action in fixtures.ACTIONS:
+            reviews.append({**self.policy.require("SYNTHETIC-DOC", action, "manager"),
+                "version_scope": "SOURCE", "allowed_actors": ["manager", "buyer"] if action in buyer_actions else ["manager"]})
+        reviews.append({**self.policy.require("SYNTHETIC-SOURCE", "external_process", "manager"),
+            "version_scope": "SOURCE", "allowed_actors": ["manager", "buyer"]})
+        strict = SourcePolicy.from_config({"schema_version": 1, "registry": [
+            {"source_id": "SYNTHETIC-DOC", "url": "https://example.org/synthetic-terms"},
+            {"source_id": "SYNTHETIC-SOURCE", "url": self.catalog.sources["SYNTHETIC-SOURCE"]["url"]}],
+            "reviews": reviews, "capabilities": {"manager": ["DATA_MANAGER"]}})
+        self.policy = self.rag.registry.policy = strict
+        self.document()
+        self.rag.prepare_metadata("manager", item_ids=[self.item])
+        self.assertEqual(self.rag.prepare("buyer", self.item)["status"], "COMPLETED")
+        saved = self.rag.ask("buyer", self.item, "SYNTHETIC strict actor checklist", fixtures.INPUTS)
+        self.assertEqual(saved["readiness"]["status"], "INDEX_READY")
+        self.assertTrue(saved["conditions"])
+        checklist = self.rag.checklist(self.item, fixtures.INPUTS, user_id="buyer", review_id=saved["review_id"])
+        self.assertEqual(checklist["readiness"]["status"], "INDEX_READY")
+        self.assertTrue(checklist["documents"])
+        self.assertEqual(checklist["conditions"], saved["conditions"])
+        self.assertTrue(checklist["evidence"])
+        self.assertFalse(checklist["conditions_ok"])
+        for actor in (None, "outsider"):
+            with self.subTest(actor=actor):
+                denied = self.rag.checklist(self.item, fixtures.INPUTS, user_id=actor, review_id=saved["review_id"])
+                self.assertEqual(denied["readiness"]["status"], "DOC_BLOCKED")
+                self.assertEqual(denied["documents"], [])
+                self.assertEqual(denied["conditions"], [])
+                self.assertEqual(denied["evidence"], [])
 
     def test_vector_merge_validates_inputs_before_adapter_and_preserves_other_rows(self):
         store = self.rag.vectors
