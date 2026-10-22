@@ -7,9 +7,11 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import logging
 import os
 from pathlib import Path
 import re
+import threading
 from typing import Any, Protocol
 
 from .errors import ServiceError
@@ -22,6 +24,8 @@ _VARIABLES = {
     "selection": ("item", "question", "applicability", "candidates"),
     "answer": ("item", "question", "applicability", "evidence", "missing_information", "conflicts"),
 }
+_POLICY_FIELDS = {"version", "kind", "role", "input_variables", "evidence_limits", "output_schema",
+                  "missing_information_rules", "conflict_rules", "attack_rules", "template"}
 _STR = {"type": "string", "minLength": 1, "maxLength": 16_384}
 _IDS = {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 512}, "maxItems": 100, "uniqueItems": True}
 _STRINGS = {"type": "array", "items": _STR, "maxItems": 100, "uniqueItems": True}
@@ -69,6 +73,17 @@ def _error(code: str) -> ServiceError:
 def _check_kind(kind: str) -> None:
     if not isinstance(kind, str) or kind not in _KINDS:
         raise _error("PROMPT_KIND_INVALID")
+
+
+def _valid_policy(kind, value):
+    if (not isinstance(value, dict) or set(value) != _POLICY_FIELDS or value["kind"] != kind
+            or not isinstance(value["version"], str) or not re.fullmatch(r"\d+\.\d+\.\d+", value["version"])
+            or value["input_variables"] != list(_VARIABLES[kind]) or value["output_schema"] != OUTPUT_SCHEMAS[kind]
+            or any(not isinstance(value[key], str) or not value[key].strip() for key in ("role", "template"))):
+        return False
+    return all(isinstance(value[key], list) and value[key]
+               and all(isinstance(row, str) and row.strip() for row in value[key])
+               for key in ("evidence_limits", "missing_information_rules", "conflict_rules", "attack_rules"))
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict:
@@ -187,19 +202,8 @@ class PromptStore:
             if path.stat().st_size > _LIMIT:
                 raise ValueError("Size limit")
             value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_unique_object)
-            required = {"version", "kind", "role", "input_variables", "evidence_limits", "output_schema",
-                        "missing_information_rules", "conflict_rules", "attack_rules", "template"}
-            if not isinstance(value, dict) or set(value) != required or value["kind"] != kind:
+            if not _valid_policy(kind, value):
                 raise ValueError("Invalid prompt contract")
-            if not isinstance(value["version"], str) or not re.fullmatch(r"\d+\.\d+\.\d+", value["version"]):
-                raise ValueError("Version required")
-            if value["input_variables"] != list(_VARIABLES[kind]) or value["output_schema"] != OUTPUT_SCHEMAS[kind]:
-                raise ValueError("Schema mismatch")
-            if any(not isinstance(value[key], str) or not value[key].strip() for key in ("role", "template")):
-                raise ValueError("Instruction required")
-            for key in ("evidence_limits", "missing_information_rules", "conflict_rules", "attack_rules"):
-                if not isinstance(value[key], list) or not value[key] or not all(isinstance(row, str) and row.strip() for row in value[key]):
-                    raise ValueError("Rules required")
             return value
         except (OSError, TypeError, ValueError, KeyError, RecursionError):
             raise _error("PROMPT_CONFIG_INVALID") from None
@@ -292,6 +296,42 @@ class MockStructuredModel:
         raise _error("PROMPT_KIND_INVALID")
 
 
+def _public_model_identifier(value) -> bool:
+    return (isinstance(value, str) and not value.startswith("sk-")
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}", value) is not None)
+
+
+def _quiet_sdk_logs() -> None:
+    """SDK debug logs contain request bodies; keep them out of product logs.
+
+    Only provider/HTTP library loggers are suppressed. Application security and
+    audit loggers are unaffected. The namespace boundary also stops propagation
+    from library loggers created after this function runs.
+    """
+    prefixes = ("openai", "httpx", "httpcore")
+    for prefix in prefixes:
+        logger = logging.getLogger(prefix)
+        logger.handlers = [logging.NullHandler()]
+        logger.propagate = False
+        logger.disabled = True
+    for name, logger in list(logging.Logger.manager.loggerDict.items()):
+        if isinstance(logger, logging.Logger) and any(name.startswith(prefix + ".") for prefix in prefixes):
+            logger.disabled = True
+
+
+def _official_sdk_client(api_key):
+    """Lazy fixed-origin client with no ambient proxy or redirect following."""
+    from openai import OpenAI, DefaultHttpxClient
+    _quiet_sdk_logs()
+    transport = DefaultHttpxClient(timeout=20.0, follow_redirects=False, trust_env=False)
+    try:
+        return OpenAI(api_key=api_key, base_url="https://api.openai.com/v1",
+                      timeout=20.0, max_retries=0, http_client=transport)
+    except Exception:
+        transport.close()
+        raise
+
+
 class OpenAIStructuredModel:
     """Opt-in SDK adapter; constructing it never opens a network connection.
 
@@ -303,24 +343,76 @@ class OpenAIStructuredModel:
     a server-side test seam, never a user-supplied argument.
     """
     is_mock = False
+    is_remote = True
 
-    def __init__(self, settings, external_process_guard=None, *, client=None, env=None):
+    def __init__(self, settings, external_process_guard=None, *, client=None, env=None,
+                 requested_model_version=None):
         environment = os.environ if env is None else env
         self.enabled = settings.remote_models is True
         self._api_key = environment.get("OPENAI_API_KEY", "")
         self.model_id = environment.get("CHAT_MODEL", "")
         self._guard = external_process_guard
         self._client = client
+        self._owns_client = client is None
+        self._client_lock = threading.Lock()
+        self._last_response = threading.local()
+        version = requested_model_version if requested_model_version is not None else environment.get("CHAT_MODEL_VERSION")
+        self._requested_version = version if _public_model_identifier(version) else None
+
+    def _configured(self):
+        return (self.enabled and isinstance(self._api_key, str) and bool(self._api_key.strip())
+                and _public_model_identifier(self.model_id) and callable(self._guard))
+
+    def metadata(self):
+        """Configuration readiness is separate from per-context authorization."""
+        return {"provider": "openai", "model_id": self.model_id if _public_model_identifier(self.model_id) else None,
+                "model_version": self._requested_version,
+                "version_source": "SERVER_CONFIGURED_NOT_PROVIDER_VERIFIED" if self._requested_version else "UNKNOWN",
+                "provider_reported_model": getattr(self._last_response, "model", None),
+                "is_mock": False, "is_remote": True, "can_generate": bool(self._configured()),
+                "authorization": "per_context_required", "temperature": None, "sampling": "provider_default",
+                "generation_settings": {"max_output_tokens": 4096, "text": {"format": {"type": "json_object"}},
+                                        "store": False, "tools": []},
+                "transport_settings": {"timeout_seconds": 20.0, "max_retries": 0,
+                                       "follow_redirects": False, "trust_env": False}}
+
+    def close(self):
+        with self._client_lock:
+            if self._owns_client and self._client is not None:
+                self._client.close()
+                self._client = None
 
     def generate(self, kind: str, prompt: str) -> str:
         _check_kind(kind)
-        if (not self.enabled or not isinstance(self._api_key, str) or not self._api_key.strip()
-                or not isinstance(self.model_id, str) or not self.model_id.strip()
-                or len(self.model_id) > 200 or not callable(self._guard)):
+        self._last_response.model = None
+        if not self._configured():
             raise _error("MODEL_REMOTE_BLOCKED")
         try:
-            envelope = json.loads(prompt)
+            if not isinstance(prompt, str) or len(prompt.encode("utf-8")) > 1_048_576:
+                raise ValueError("Invalid input")
+            envelope = json.loads(prompt, object_pairs_hook=_unique_object)
+            if not isinstance(envelope, dict) or set(envelope) - {"policy", "input", "format_repair"}:
+                raise ValueError("Invalid input")
             variables = envelope["input"]
+            policy = envelope["policy"]
+            if (not isinstance(variables, dict) or set(variables) != set(_VARIABLES[kind])
+                    or not isinstance(variables["item"], dict) or not isinstance(variables["applicability"], dict)
+                    or not isinstance(variables["question"], str) or not variables["question"].strip()
+                    or len(variables["question"]) > 5000 or not _valid_policy(kind, policy)):
+                raise ValueError("Invalid input")
+            if "format_repair" in envelope and envelope["format_repair"] != {
+                    "attempt": 1, "code": "MODEL_OUTPUT_INVALID", "output_schema": output_schema(kind)}:
+                raise ValueError("Invalid repair")
+            for key in ("candidates", "evidence"):
+                if key in variables and (not isinstance(variables[key], list) or len(variables[key]) > 100
+                                         or any(not isinstance(row, dict) for row in variables[key])):
+                    raise ValueError("Invalid input")
+            for key in ("missing_information", "conflicts"):
+                if key in variables and (not isinstance(variables[key], list) or len(variables[key]) > 100
+                                         or any(not isinstance(row, str) for row in variables[key])):
+                    raise ValueError("Invalid input")
+            # Reject nonfinite values before any authorization callback or SDK call.
+            json.dumps(envelope, allow_nan=False)
             contexts = [("item", variables["item"]), ("question", {"question": variables["question"]}),
                         ("applicability", variables["applicability"])]
             contexts.extend(("candidate", row) for row in variables.get("candidates", []))
@@ -334,11 +426,10 @@ class OpenAIStructuredModel:
         except Exception:
             raise _error("MODEL_REMOTE_BLOCKED") from None
         try:
-            if self._client is None:
-                from openai import OpenAI
-                # Explicit origin prevents OPENAI_BASE_URL from redirecting data.
-                self._client = OpenAI(api_key=self._api_key, base_url="https://api.openai.com/v1",
-                                      timeout=20.0, max_retries=0)
+            _quiet_sdk_logs()
+            with self._client_lock:
+                if self._client is None:
+                    self._client = _official_sdk_client(self._api_key)
             model_input = {"input": variables}
             if "format_repair" in envelope:
                 model_input["format_repair"] = envelope["format_repair"]
@@ -349,8 +440,20 @@ class OpenAIStructuredModel:
                 text={"format": {"type": "json_object"}},
                 store=False, tools=[], max_output_tokens=4096,
             )
-            if not isinstance(response.output_text, str) or not response.output_text.strip():
+            if (getattr(response, "status", "completed") != "completed"
+                    or getattr(response, "error", None) is not None
+                    or getattr(response, "incomplete_details", None) is not None):
+                raise ValueError("Incomplete response")
+            for entry in getattr(response, "output", ()) or ():
+                if getattr(entry, "type", "message") not in {"message", "reasoning"}:
+                    raise ValueError("Unexpected tool output")
+                if any(getattr(part, "type", None) == "refusal" for part in getattr(entry, "content", ()) or ()):
+                    raise ValueError("Refusal")
+            if (not isinstance(response.output_text, str) or not response.output_text.strip()
+                    or len(response.output_text.encode("utf-8")) > _LIMIT):
                 raise ValueError("No structured output")
+            reported = getattr(response, "model", None)
+            self._last_response.model = reported if _public_model_identifier(reported) else None
             return response.output_text
         except Exception:
             raise _error("MODEL_UNAVAILABLE") from None
