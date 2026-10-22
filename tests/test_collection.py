@@ -143,14 +143,128 @@ class CollectionTests(unittest.TestCase):
         self.assertEqual(len(self.fetcher.calls), 1)
         self.assertEqual(len(self.search.calls), 1)
 
-    def test_source_rights_are_rechecked_before_reusing_success_cache(self):
+    def test_current_display_rights_are_rechecked_before_reusing_success_cache(self):
         self.target()
         self.assertEqual(self.collect()["status"], "FETCHED")
-        self.change_review("SYNTHETIC-0", "extract", "BLOCKED")
+        self.change_review("SYNTHETIC-0", "display_excerpt", "BLOCKED")
         blocked = self.collect()
         self.assertEqual(blocked["status"], "BLOCKED")
         self.assertEqual(blocked["version_ids"], [])
         self.assertEqual(blocked["errors"][0]["code"], "SOURCE_BLOCKED")
+        self.assertEqual(len(self.fetcher.calls), 1)
+
+    def strict_actor_policy(self):
+        readers = ["buyer", "seller", "admin", "manager"]
+        self.reviews = [{**review, "version_scope": "SOURCE",
+                         "allowed_actors": ["manager"] if review["action"] in {"fetch", "store_body", "extract"} else readers}
+                        for review in self.reviews]
+        self.policy = SourcePolicy.from_config({"schema_version": 1, "registry": self.sources,
+            "reviews": self.reviews, "capabilities": {"manager": ["DATA_MANAGER"]}})
+        self.registry.policy = self.policy
+
+    def test_strict_manager_collected_body_is_reused_by_reader_without_manager_or_http(self):
+        self.strict_actor_policy()
+        target_id = self.target()
+        fetched = self.registry.fetch_target("manager", target_id)
+        self.fetcher.calls.clear()
+        self.assertFalse(self.policy.allows("SYNTHETIC-0", "extract", actor="buyer", version_id=fetched["version_id"]))
+        collector = Collector(self.registry, manager_actor=None)
+        result = collector.collect(self.item, "Reader question", ["transfer"], INPUTS, "buyer")
+        self.assertEqual((result["status"], result["cache_hits"]), ("FETCHED", 1))
+        self.assertEqual(result["linked"], [{"candidate_id": target_id, "version_id": fetched["version_id"],
+                                          "role": "SERVICE_TERMS", "item_id": self.item}])
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(self.fetcher.calls, [])
+
+    def test_strict_new_collection_uses_only_configured_manager_for_one_request(self):
+        self.strict_actor_policy()
+        self.target()
+        first, second = self.collect(), self.collect()
+        self.assertEqual((first["status"], second["status"]), ("FETCHED", "FETCHED"))
+        self.assertEqual(second["cache_hits"], 1)
+        self.assertEqual(self.fetcher.calls, [("SYNTHETIC-0", self.sources[0]["url"], "manager")])
+        self.assertFalse(self.policy.allows("SYNTHETIC-0", "fetch", actor="buyer"))
+
+    def test_strict_outsider_cannot_reuse_reader_cache_or_inject_discovery(self):
+        self.strict_actor_policy()
+        self.target()
+        self.assertEqual(self.collect()["status"], "FETCHED")
+        candidates = self.discover()
+        with self.assertRaises(ServiceError) as raised:
+            self.collector.discover(self.item, "Question", ["transfer"], INPUTS, "outsider")
+        self.assertEqual(raised.exception.code, "SOURCE_BLOCKED")
+        result = self.collector.collect(self.item, "Question", ["transfer"], INPUTS, "outsider", candidates=candidates)
+        self.assertEqual((result["status"], result["linked"]), ("BLOCKED", []))
+        self.assertEqual(result["errors"][0]["code"], "SOURCE_BLOCKED")
+        self.assertEqual(len(self.fetcher.calls), 1)
+
+    def test_strict_body_action_withdrawal_blocks_new_work_and_preserves_allowed_read(self):
+        self.strict_actor_policy()
+        self.target()
+        self.assertEqual(self.collect()["status"], "FETCHED")
+        for action in ("fetch", "store_body", "extract"):
+            with self.subTest(action=action):
+                self.change_review("SYNTHETIC-0", action, "BLOCKED")
+                self.assertEqual(self.collect()["status"], "FETCHED")
+                refreshed = self.collect(refresh=True)
+                self.assertEqual((refreshed["status"], refreshed["linked"]), ("BLOCKED", []))
+                self.assertEqual(refreshed["errors"][0]["code"], "SOURCE_BLOCKED")
+                self.assertEqual(self.collect()["status"], "FETCHED")
+                self.change_review("SYNTHETIC-0", action, "ALLOWED")
+        self.assertEqual(len(self.fetcher.calls), 1)
+
+    def test_strict_display_withdrawal_and_reapproval_recheck_exact_reader(self):
+        self.strict_actor_policy()
+        self.target()
+        self.assertEqual(self.collect()["status"], "FETCHED")
+        self.change_review("SYNTHETIC-0", "display_excerpt", "BLOCKED")
+        blocked = self.collect()
+        self.assertEqual((blocked["status"], blocked["linked"]), ("BLOCKED", []))
+        self.change_review("SYNTHETIC-0", "display_excerpt", "ALLOWED")
+        self.assertEqual(self.collect()["status"], "FETCHED")
+        self.assertEqual(len(self.fetcher.calls), 1)
+
+    def test_strict_buyer_cannot_be_inferred_or_upgraded_to_collection_manager(self):
+        self.strict_actor_policy()
+        self.target()
+        collector = Collector(self.registry, manager_actor="buyer")
+        result = collector.collect(self.item, "Question", ["transfer"], INPUTS, "buyer")
+        self.assertEqual((result["status"], result["linked"]), ("BLOCKED", []))
+        self.assertEqual(result["errors"][0]["code"], "FORBIDDEN")
+        self.assertEqual(self.fetcher.calls, [])
+
+    def test_cached_body_integrity_is_checked_without_automatic_refetch(self):
+        self.strict_actor_policy()
+        self.target()
+        self.assertEqual(self.collect()["status"], "FETCHED")
+        candidate = self.registry.candidates(self.item)[0]
+        Path(candidate["body_path"]).write_text('[{"text":"SYNTHETIC tampered body"}]', encoding="utf-8")
+        result = self.collect()
+        self.assertEqual((result["status"], result["linked"]), ("FAILED", []))
+        self.assertEqual(result["errors"][0]["code"], "PARSE_FAILED")
+        self.assertEqual(len(self.fetcher.calls), 1)
+
+    def test_cached_version_hash_and_target_scope_remain_authoritative(self):
+        self.strict_actor_policy()
+        self.target()
+        self.assertEqual(self.collect()["status"], "FETCHED")
+        # SQL independently forbids changing immutable target/version rows.
+        # A corrupted registry projection must also fail the cache boundary.
+        registered, linked = self.registry.registered_candidates, self.registry.candidates
+        def wrong_scope(item_id=None):
+            rows = copy.deepcopy(registered(item_id))
+            rows[0]["applicability"] = {**SCOPE, "country": "SYNTHETIC other"}
+            return rows
+        with patch.object(self.registry, "registered_candidates", side_effect=wrong_scope):
+            self.assertEqual(self.collect()["status"], "BLOCKED")
+        def wrong_hash(item_id=None):
+            rows = copy.deepcopy(linked(item_id))
+            rows[0]["body_hash"] = "0" * 64
+            return rows
+        with patch.object(self.registry, "candidates", side_effect=wrong_hash):
+            result = self.collect()
+        self.assertEqual((result["status"], result["linked"]), ("FAILED", []))
+        self.assertEqual(result["errors"][0]["code"], "PARSE_FAILED")
         self.assertEqual(len(self.fetcher.calls), 1)
 
     def test_source_action_denied_before_any_body_request(self):

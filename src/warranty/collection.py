@@ -19,6 +19,7 @@ from .errors import ServiceError
 
 
 _BODY_ACTIONS = ("view_link", "fetch", "store_body", "extract")
+_READ_ACTIONS = ("view_link", "display_excerpt")
 _BLOCKED = {"FORBIDDEN", "SOURCE_BLOCKED", "NETWORK_DISABLED", "URL_BLOCKED", "DEMO_LOGIN_DISABLED"}
 
 
@@ -132,13 +133,13 @@ class Collector:
             result[row["id"]] = row
         return result
 
-    def _reviews(self, candidate, actor):
+    def _reviews(self, candidate, actor, actions=_READ_ACTIONS):
         values = {}
         try:
             values["source"] = self.registry.policy.source(candidate["source_id"])
         except ServiceError:
             values["source"] = "BLOCKED"
-        for action in (*_BODY_ACTIONS, "local_embed"):
+        for action in actions:
             try:
                 values[action] = self.registry.policy.require(candidate["source_id"], action, actor=actor,
                                                               version_id=candidate["version_id"])
@@ -150,6 +151,28 @@ class Collector:
         for action in actions:
             self.registry.policy.require(candidate["source_id"], action, actor=actor,
                                          version_id=candidate["version_id"])
+
+    def _read_existing(self, candidate, actor):
+        """Validate an already linked version under the current reader's rights.
+
+        A stored body is not a new fetch/store/extract operation. The registry
+        remains authoritative for its item/role/scope and storage integrity.
+        """
+        self._require(candidate, actor, _READ_ACTIONS)
+        for row in self.registry.candidates(candidate["item_id"]):
+            if (row["document_id"], row["version_id"], row["role"]) != (
+                    candidate["document_id"], candidate["version_id"], candidate["role"]):
+                continue
+            linked = self._candidate(row)
+            if any(linked[key] != candidate[key] for key in
+                   ("source_id", "url", "type", "scope", "applicability_basis", "locator", "published_on", "source_version_note")):
+                raise ServiceError("SOURCE_BLOCKED", "저장 문서와 등록된 적용 범위가 일치하지 않습니다.", 403)
+            if row["version_id"] != "ver-" + digest([row["document_id"], row["body_hash"]])[:32]:
+                raise ServiceError("PARSE_FAILED", "저장 문서의 버전 무결성을 확인해야 합니다.", 409)
+            self.registry.sections(row, actor, action="display_excerpt")
+            self._require(candidate, actor, _READ_ACTIONS)
+            return
+        raise ServiceError("SOURCE_BLOCKED", "승인된 항목 문서 연결을 확인해야 합니다.", 403)
 
     def _cache_get(self, kind, key):
         with closing(self.db.connect()) as connection:
@@ -222,7 +245,9 @@ class Collector:
         return digest([candidate["source_id"], candidate["item_id"], scope,
                        sorted({normalize(term).casefold() for term in terms}),
                        {key: candidate[key] for key in ("id", "document_id", "url", "type", "role", "scope", "applicability_basis", "published_on", "source_version_note")},
-                       self._reviews(candidate, actor)])
+                       actor, self._reviews(candidate, actor),
+                       {"actor": self.manager_actor, "reviews": self._reviews(candidate, self.manager_actor, _BODY_ACTIONS)}
+                       if candidate["version_id"] is None else None])
 
     def collect(self, item_id, question, queries, applicability, actor, *, selected_candidate_ids=None,
                 candidates=None, refresh=False):
@@ -264,25 +289,24 @@ class Collector:
                 result["cache_keys"].append(key)
                 try:
                     # Recheck rights before every cache read or body reuse.
-                    self._require(candidate, actor, _BODY_ACTIONS)
+                    self._require(candidate, actor, _READ_ACTIONS)
                     cached = None if refresh else self._cache_get("collection_fetch", key)
-                    if cached and cached["status"] == "FAILED":
+                    version_id = candidate["version_id"]
+                    if not version_id and cached and cached["status"] == "FAILED":
                         result["errors"].append(cached["value"]["error"])
                         continue
-                    version_id = candidate["version_id"]
                     cache_hit = False
-                    if (not refresh and cached and cached["status"] in {"FETCHED", "INDEXED"}
-                            and version_id and cached["value"].get("version_id") == version_id):
+                    if version_id and not refresh:
+                        self._read_existing(candidate, actor)
                         cache_hit = True
                     elif candidate["target_id"]:
                         if self.manager_actor is None:
                             raise ServiceError("FORBIDDEN", "문서 수집 담당자 설정이 필요합니다.", 403)
                         self.registry.policy.require_capability(self.manager_actor, "DATA_MANAGER")
+                        self._require(candidate, self.manager_actor, _BODY_ACTIONS)
                         fetched = self.registry.fetch_target(self.manager_actor, candidate["target_id"], key, refresh=refresh)
                         version_id = fetched["version_id"]
                         cache_hit = fetched.get("cache_hit") is True
-                    elif version_id and not refresh:
-                        cache_hit = True
                     else:
                         raise ServiceError("SOURCE_BLOCKED", "본문 갱신에는 등록된 문서 수집 대상이 필요합니다.", 403)
                     if not isinstance(version_id, str) or not version_id:
@@ -292,7 +316,7 @@ class Collector:
                     completed = self._inventory(item_id).get(identifier)
                     if not completed or completed["version_id"] != version_id:
                         raise ServiceError("SOURCE_BLOCKED", "수집 문서와 등록 대상의 연결을 확인하지 못했습니다.", 403)
-                    self._require(completed, actor, _BODY_ACTIONS)
+                    self._read_existing(completed, actor)
                     key = self._fetch_key(completed, terms, scope, actor)
                     if key not in result["cache_keys"]:
                         result["cache_keys"].append(key)
