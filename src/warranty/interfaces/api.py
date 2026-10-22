@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException
 
 from warranty.errors import ServiceError
+from warranty.live import LIVE_PURPOSES
 from warranty.security import SessionStore
 
 
@@ -57,6 +58,33 @@ def _applicability(value):
         if item is not None and (not isinstance(item, str) or len(item) > 200):
             _fail("INVALID_INPUT", "적용성 값이 너무 길거나 지원하지 않는 형식입니다.")
     return {key: item for key, item in value.items() if item is not None and item.strip()}
+
+
+def _public_runtime(value):
+    """Never serialize private runtime configuration or adapter objects."""
+    value = value if isinstance(value, dict) else {}
+    projected = {}
+    for kind in ("chat", "embedding"):
+        adapter = value.get(kind, {})
+        adapter = adapter if isinstance(adapter, dict) else {}
+        provider = adapter.get("provider")
+        projected[kind] = {"provider": provider if provider in {"mock", "openai", "gms"} else "unavailable",
+                           **{field: adapter.get(field) is True for field in ("configured", "ready", "is_mock")}}
+    collection = value.get("collection", {})
+    collection = collection if isinstance(collection, dict) else {}
+    count = collection.get("registered_target_count")
+    projected["collection"] = {"enabled": collection.get("enabled") is True,
+                               "network_enabled": collection.get("network_enabled") is True,
+                               "registered_target_count": count if type(count) is int and 0 <= count <= 100000 else 0}
+    for field in ("external_processing_approved", "question_processing_approved", "document_worker_enabled"):
+        projected[field] = value.get(field) is True
+    live = value.get("live", {})
+    live = live if isinstance(live, dict) else {}
+    purposes = live.get("purposes")
+    projected["live"] = {**{field: live.get(field) is True for field in ("enabled", "ready", "budget_confirmed")},
+                         "purposes": [purpose for purpose in LIVE_PURPOSES
+                                      if isinstance(purposes, list) and purpose in purposes]}
+    return projected
 
 
 async def _body(request, *, allow_identity=False):
@@ -147,6 +175,13 @@ def create_app(application=None):
     async def health(request: Request):
         return respond(request, {"status": "ok", "demo_mode": application.settings.demo_mode,
                                  "real_uploads": False})
+
+    @app.get("/runtime")
+    async def runtime_status(request: Request):
+        identity(request)
+        status_provider = getattr(application, "runtime_status", None)
+        status = status_provider() if callable(status_provider) else {}
+        return respond(request, _public_runtime(status))
 
     @app.post("/session")
     async def login(request: Request):
@@ -252,15 +287,34 @@ def create_app(application=None):
     async def prepare(request: Request, item_id: str):
         session = identity(request, True)
         body = await _body(request)
-        if body:
+        if set(body) - {"applicability", "question"}:
             _fail("FORBIDDEN", "서버에 등록된 문서만 준비할 수 있습니다.", 403)
         application.catalog.get(item_id)
-        return respond(request, application.rag.prepare(session.actor, item_id), status=202)
+        question = body.get("question")
+        if question is not None:
+            question = _string(question, "문서 준비 질문", 5000)
+        enqueue = getattr(application.rag, "enqueue_prepare", None)
+        if not callable(enqueue):
+            _fail("JOBS_UNAVAILABLE", "문서 준비 처리기를 설정한 후 다시 요청해 주세요.", 503)
+        return respond(request, enqueue(session.actor, item_id, _applicability(body.get("applicability")), question), status=202)
 
     @app.get("/index-jobs/{job_id}")
     async def job(request: Request, job_id: str):
         session = identity(request)
         return respond(request, application.rag.job(session.actor, job_id))
+
+    @app.post("/index-jobs/{job_id}/retry")
+    async def retry_document_job(request: Request, job_id: str):
+        session = identity(request, True)
+        if await _body(request):
+            _fail("FORBIDDEN", "기존 문서 준비 작업만 다시 요청할 수 있습니다.", 403)
+        retry = getattr(application.rag, "retry_prepare", None)
+        if not callable(retry):
+            queue = getattr(application.rag, "document_jobs", None)
+            retry = getattr(queue, "retry", None)
+        if not callable(retry):
+            _fail("JOBS_UNAVAILABLE", "문서 준비 처리기를 설정한 후 다시 요청해 주세요.", 503)
+        return respond(request, retry(session.actor, _string(job_id, "작업 ID", 128)), status=202)
 
     @app.post("/trades")
     async def create_trade(request: Request):

@@ -71,7 +71,7 @@ def _contains_mock(value, *, text_field=False, model_field=False):
         if normalized in {"mode", "execution_mode"} and isinstance(part, str) and part.upper() == "MOCK":
             return True
         if _contains_mock(part,
-                          text_field=normalized in {"answer", "text", "content", "response", "output", "output_text", "generated_text"},
+                          text_field=normalized in {"answer", "text", "content", "response", "raw_response", "output", "output_text", "generated_text"},
                           model_field=model_field or normalized in {"model", "model_metadata", "model_id", "model_name", "model_version", "provider"}):
             return True
     return False
@@ -312,6 +312,10 @@ class ComparisonRunner:
         try:
             raw = _json_copy(raw)
             entry["raw_callback_result"] = raw
+            if isinstance(raw, dict) and raw.get("evaluation_error"):
+                code = raw["evaluation_error"].get("code") if isinstance(raw["evaluation_error"], dict) else None
+                entry["error"] = {"code": code if isinstance(code, str) and _CODE.fullmatch(code) else "EVALUATION_CALLBACK_FAILED"}
+                return entry
             response, envelope = self._execution(raw, answers=answers)
             if answers:
                 entry["raw_response"] = response
@@ -383,3 +387,12 @@ class ComparisonRunner:
     def run_retrieval(self, cases, retrieve, *, top_k=6, filters=None):
         return self._run(cases, {"similarity": retrieve, "mmr": retrieve}, comparison="retrieval",
                          top_k=top_k, filters={} if filters is None else filters)
+
+    def save_report(self, comparison, report):
+        """Persist a runtime report through the same private-output boundary."""
+        if comparison not in {"runtime", "performance"} or not isinstance(report, dict):
+            _error()
+        return self._save({**_json_copy(report), "comparison": comparison,
+                           "config_fingerprint": self.config_fingerprint,
+                           "context": self._context(), "mode": self.mode,
+                           "acceptance_status": "NOT_ASSESSED", "scores": None})

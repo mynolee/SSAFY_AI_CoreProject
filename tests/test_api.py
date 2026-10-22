@@ -1,7 +1,9 @@
 """HTTP adapter checks with synthetic, service-owned facts and identities."""
 from pathlib import Path
 from contextlib import ExitStack
+from concurrent.futures import ThreadPoolExecutor
 import json
+import threading
 from types import SimpleNamespace
 import tempfile
 import unittest
@@ -48,7 +50,15 @@ class RagStub:
         return {"conditions": [], "classification": "NEEDS_INFORMATION", "missing_information": ["공식 본문"]}
 
     def prepare(self, actor, item_id):
-        return {"job_id": "synthetic-job", "status": "BLOCKED"}
+        raise AssertionError("The HTTP adapter must enqueue document work without running it")
+
+    def enqueue_prepare(self, actor, item_id, applicability=None, question=None):
+        self.enqueued = (actor, item_id, applicability, question)
+        return {"job_id": "synthetic-job", "item_id": item_id, "status": "BLOCKED", "stage": "DOC_BLOCKED"}
+
+    def retry_prepare(self, actor, job_id):
+        self.retried = (actor, job_id)
+        return {"job_id": job_id, "status": "QUEUED", "stage": "QUEUED", "retryable": False}
 
     def job(self, actor, job_id):
         return {"job_id": job_id, "status": "BLOCKED"}
@@ -183,6 +193,72 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 202)
         self.assertEqual(response.json()["data"]["status"], "BLOCKED")
 
+    def test_document_enqueue_preserves_scope_and_rejects_worker_controls(self):
+        self.login()
+        response = self.client.post("/items/synthetic-a/index-jobs", json={
+            "question": "  SYNTHETIC transfer requirements  ", "applicability": {"country": "SYNTHETIC"}}, headers=self.headers)
+        self.assertEqual(202, response.status_code, response.text)
+        self.assertEqual(("buyer", "synthetic-a", {"country": "SYNTHETIC"}, "SYNTHETIC transfer requirements"), self.application.rag.enqueued)
+        for body in ({"outcome": "COMPLETED"}, {"source_id": "forged-source"}, {"worker": "manager"},
+                     {"actor": "admin"}, {"applicability": {"allowed_hosts": ["localhost"]}}):
+            with self.subTest(body=body):
+                self.assertIn(self.client.post("/items/synthetic-a/index-jobs", json=body, headers=self.headers).status_code, (400, 403))
+        self.assertEqual(403, self.client.post("/items/synthetic-a/index-jobs", json={}, headers={"Origin": "http://localhost"}).status_code)
+
+    def test_document_retry_uses_existing_job_and_server_session(self):
+        self.login("seller")
+        response = self.client.post("/index-jobs/synthetic-job/retry", json={}, headers=self.headers)
+        self.assertEqual(202, response.status_code, response.text)
+        self.assertEqual("QUEUED", response.json()["data"]["status"])
+        self.assertEqual(("seller", "synthetic-job"), self.application.rag.retried)
+        self.assertEqual(403, self.client.post("/index-jobs/synthetic-job/retry", json={"outcome": "COMPLETED"}, headers=self.headers).status_code)
+        self.assertEqual(403, self.client.post("/index-jobs/synthetic-job/retry", json={}, headers={"Origin": "http://localhost"}).status_code)
+
+    def test_runtime_status_is_authenticated_allowlisted_configuration_readiness(self):
+        self.assertEqual(401, self.client.get("/runtime").status_code)
+        self.login()
+        secret = "SYNTHETIC_PRIVATE_RUNTIME_VALUE"
+        self.application.runtime_status = lambda: {
+            "chat": {"provider": "openai", "configured": True, "ready": True, "is_mock": False, "api_key": secret},
+            "embedding": {"provider": "mock", "configured": True, "ready": True, "is_mock": True, "path": secret},
+            "collection": {"enabled": True, "network_enabled": False, "registered_target_count": 2, "source_path": secret},
+            "external_processing_approved": True, "question_processing_approved": False,
+            "document_worker_enabled": True, "private_config": secret}
+        response = self.client.get("/runtime")
+        self.assertEqual(200, response.status_code)
+        data = response.json()["data"]
+        self.assertEqual({"chat", "embedding", "collection", "external_processing_approved", "question_processing_approved", "document_worker_enabled", "live"}, set(data))
+        self.assertEqual({"provider", "configured", "ready", "is_mock"}, set(data["chat"]))
+        self.assertEqual(2, data["collection"]["registered_target_count"])
+        self.assertNotIn(secret, response.text)
+        self.assertNotIn("api_key", response.text)
+
+    def test_gms_runtime_read_is_live_configuration_only_and_strips_private_budget(self):
+        self.login()
+        secret = "SYNTHETIC_PRIVATE_GMS_VALUE"
+        calls = []
+        def status():
+            calls.append("read-only-status")
+            return {"chat": {"provider": "gms", "configured": True, "ready": False, "is_mock": False},
+                    "embedding": {"provider": "gms", "configured": True, "ready": False, "is_mock": False},
+                    "live": {"enabled": True, "ready": False, "budget_confirmed": False,
+                             "purposes": ["demo", "verification", "demo", secret],
+                             "approval_id": secret, "api_key": secret, "store_path": secret,
+                             "actual_credits": secret, "live_verified": True}, "private_config": secret}
+        self.application.runtime_status = status
+        for _ in range(2):
+            response = self.client.get("/runtime")
+            self.assertEqual(200, response.status_code, response.text)
+            data = response.json()["data"]
+            self.assertEqual("gms", data["chat"]["provider"])
+            self.assertFalse(data["chat"]["ready"])
+            self.assertFalse(data["chat"]["is_mock"])
+            self.assertEqual({"enabled": True, "ready": False, "budget_confirmed": False,
+                              "purposes": ["verification", "demo"]}, data["live"])
+            self.assertNotIn(secret, response.text)
+            self.assertNotIn("live_verified", response.text)
+        self.assertEqual(["read-only-status", "read-only-status"], calls)
+
     def test_trade_route_passes_key_version_and_only_session_actor(self):
         self.login()
         body = {"expected_version": 2, "revision": 1, "hash": "synthetic-hash"}
@@ -241,6 +317,78 @@ class ApiTests(unittest.TestCase):
 
 
 class SharedServiceApiTests(unittest.TestCase):
+    def test_http_enqueue_returns_before_worker_and_get_shows_actual_progress(self):
+        from warranty.catalog import Catalog
+        from warranty.db import Database
+        from warranty.jobs import DocumentJobQueue
+
+        with ExitStack() as cleanup:
+            base = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix="synthetic-api-job-")))
+            catalog = Catalog.synthetic()
+            db = Database(base / "app.sqlite3")
+            db.initialize()
+            cleanup.callback(db.close)
+            with db.transaction() as connection:
+                for item in catalog.items:
+                    connection.execute("INSERT INTO items(item_id,name,provider) VALUES(?,?,?)",
+                                       (item["item_id"], item["name"], item["provider"]))
+            reached, release = threading.Event(), threading.Event()
+            requests = []
+            def handler(request, progress):
+                requests.append(request)
+                progress("FETCHING", candidate_count=1, body_count=0)
+                reached.set()
+                if not release.wait(3):
+                    raise RuntimeError("SYNTHETIC job synchronization timed out")
+                return {"status": "BLOCKED", "stage": "DOC_BLOCKED", "failure_code": "SOURCE_BLOCKED"}
+            queue = DocumentJobQueue(db, catalog, handler, auto_start=False)
+            application = facade()
+            application.catalog = catalog
+            application.rag = SimpleNamespace(
+                enqueue_prepare=lambda actor, item, applicability, question: queue.enqueue(actor, item, {
+                    "applicability": applicability or {}, "question": question or "SYNTHETIC document preparation"}),
+                job=queue.job, retry_prepare=queue.retry)
+            client = cleanup.enter_context(TestClient(create_app(application), base_url="http://localhost", client=("127.0.0.1", 50000)))
+            headers = {"Origin": "http://localhost"}
+            def login(actor):
+                response = client.post("/session", json={"actor": actor}, headers=headers)
+                self.assertEqual(200, response.status_code)
+                headers["X-CSRF-Token"] = response.json()["data"]["csrf_token"]
+            login("buyer")
+            item = catalog.items[0]["item_id"]
+            response = client.post(f"/items/{item}/index-jobs", json={"applicability": {"country": "SYNTHETIC"}}, headers=headers)
+            self.assertEqual(202, response.status_code, response.text)
+            queued = response.json()["data"]
+            self.assertEqual("QUEUED", queued["status"])
+            self.assertEqual([], requests)
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                worker = pool.submit(queue.run_pending, 1)
+                try:
+                    self.assertTrue(reached.wait(3))
+                    running = client.get(f"/index-jobs/{queued['job_id']}").json()["data"]
+                    self.assertEqual("RUNNING", running["status"])
+                    self.assertEqual("FETCHING", running["stage"])
+                    self.assertEqual(1, running["candidate_count"])
+                    self.assertNotIn("request_json", running)
+                    self.assertNotIn("claim_token", running)
+                finally:
+                    release.set()
+                worker.result(timeout=5)
+            completed = client.get(f"/index-jobs/{queued['job_id']}").json()["data"]
+            self.assertEqual("BLOCKED", completed["status"])
+            self.assertEqual("SOURCE_BLOCKED", completed["failure_code"])
+            self.assertTrue(completed["retryable"])
+            login("seller")
+            self.assertEqual(403, client.get(f"/index-jobs/{queued['job_id']}").status_code)
+            self.assertEqual(403, client.post(f"/index-jobs/{queued['job_id']}/retry", json={}, headers=headers).status_code)
+            login("admin")
+            self.assertEqual(403, client.get(f"/index-jobs/{queued['job_id']}").status_code)
+            login("buyer")
+            retry = client.post(f"/index-jobs/{queued['job_id']}/retry", json={}, headers=headers)
+            self.assertEqual(202, retry.status_code, retry.text)
+            self.assertEqual("QUEUED", retry.json()["data"]["status"])
+            self.assertEqual(1, len(requests))
+
     def test_populated_checklist_uses_actual_rag_and_isolated_saved_review(self):
         from warranty.catalog import Catalog
         from warranty.config import Settings

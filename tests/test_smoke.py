@@ -69,8 +69,7 @@ class ProductSmokeTests(unittest.TestCase):
                 self.assertFalse(settings.remote_models)
                 self.assertFalse(settings.real_uploads)
             finally:
-                app.rag.close()
-                app.db.close()
+                app.close()
 
 
 if __name__ == "__main__":
