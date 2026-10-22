@@ -1,11 +1,13 @@
 """Server-owned sessions, source permissions and opt-in bounded HTTP access."""
 from dataclasses import dataclass
+from contextlib import contextmanager
 from datetime import date
 import copy
 import hashlib
 import hmac
 import http.client
 import ipaddress
+import re
 import secrets
 import socket
 import ssl
@@ -108,6 +110,23 @@ class SessionStore:
 ACTIONS = frozenset({"view_link", "fetch", "store_body", "extract", "local_embed",
                      "external_process", "display_excerpt", "public_redistribute"})
 BASES = frozenset({"FACT_ONLY", "LICENSE", "STATUTORY_EXCEPTION", "OTHER_RECORDED_BASIS"})
+_REVIEW_FIELDS = frozenset({"source_id", "action", "status", "basis_type", "basis_url", "reviewed_on",
+                            "scope", "conditions", "user_scope", "processing_environment"})
+_SOURCE_FIELDS = frozenset({"source_id", "url", "canonical_url", "allowed_hosts", "approved_urls", "http_limits",
+                            "title", "provider", "operator", "language", "document_type", "format", "checked_on",
+                            "source_body_included", "is_synthetic"})
+_ACTOR = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@+-]{0,127}\Z")
+
+
+def _valid_actor(value):
+    return isinstance(value, str) and _ACTOR.fullmatch(value) is not None
+
+
+def _actor_list(value):
+    if (not isinstance(value, list) or not 1 <= len(value) <= 1000
+            or any(not _valid_actor(actor) for actor in value) or len(set(value)) != len(value)):
+        raise ValueError("Invalid reviewed actor scope")
+    return value
 
 
 class SourcePolicy:
@@ -118,9 +137,11 @@ class SourcePolicy:
     """
     def __init__(self, registry=None, reviews=None, capabilities=None, network_enabled=False):
         self.network_enabled = network_enabled is True
+        self._strict = False
         self._registry, self._reviews = {}, {}
         self._capabilities = {key: frozenset(value) for key, value in (capabilities or {}).items()}
         self._lock = threading.RLock()
+        self._generation = 0
         records = registry.values() if isinstance(registry, dict) else (registry or [])
         for source in records:
             self._put_source(source)
@@ -128,11 +149,131 @@ class SourcePolicy:
         for review in records:
             self._put_review(review)
 
+    @classmethod
+    def from_config(cls, value, *, network_enabled=False):
+        """Validate a private, server-owned policy without enabling model calls.
+
+        SOURCE is an explicit source-wide review. A VERSION review overrides
+        it, including denials; no actor or version is inferred from model text.
+        File reading, external-processing approval and credential gates belong
+        to the application runtime, separately from this action policy.
+        """
+        try:
+            if (not isinstance(value, dict)
+                    or set(value) != {"schema_version", "registry", "reviews", "capabilities"}
+                    or type(value["schema_version"]) is not int or value["schema_version"] != 1
+                    or type(network_enabled) is not bool):
+                raise ValueError("Invalid policy schema")
+            registry = value["registry"]
+            if not isinstance(registry, (list, dict)) or len(registry) > 10000:
+                raise ValueError("Invalid source registry")
+            if isinstance(registry, dict):
+                if any(not isinstance(source, dict) or key != source.get("source_id")
+                       for key, source in registry.items()):
+                    raise ValueError("Source key mismatch")
+                registry = list(registry.values())
+            source_ids = set()
+            for source in registry:
+                cls._validate_strict_source(source)
+                source_id = source.get("source_id")
+                if (not isinstance(source_id, str) or not source_id.strip() or len(source_id) > 128
+                        or source_id in source_ids):
+                    raise ValueError("Invalid source identity")
+                source_ids.add(source_id)
+                if "url" in source and "canonical_url" in source:
+                    if _normalize_url(source["url"]) != _normalize_url(source["canonical_url"]):
+                        raise ValueError("Conflicting canonical URLs")
+                for key in ("source_body_included", "is_synthetic"):
+                    if key in source and type(source[key]) is not bool:
+                        raise ValueError("Invalid source declaration")
+            capabilities = value["capabilities"]
+            if not isinstance(capabilities, dict) or len(capabilities) > 1000:
+                raise ValueError("Invalid capabilities")
+            for actor, grants in capabilities.items():
+                if (not _valid_actor(actor) or not isinstance(grants, list)
+                        or any(grant != "DATA_MANAGER" for grant in grants)
+                        or len(set(grants)) != len(grants)):
+                    raise ValueError("Invalid capability assignment")
+            reviews = value["reviews"]
+            if not isinstance(reviews, list) or len(reviews) > 50000:
+                raise ValueError("Invalid review records")
+            review_keys = set()
+            for review in reviews:
+                cls._validate_strict_review(review)
+                version = review.get("version_id", review.get("document_version_id"))
+                key = review["source_id"], version, review["action"]
+                if key in review_keys:
+                    raise ValueError("Duplicate action review")
+                review_keys.add(key)
+            policy = cls(registry, reviews, capabilities, network_enabled=network_enabled)
+            policy._strict = True
+            return policy
+        except (ServiceError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+            raise ServiceError("CONFIG_INVALID", "출처별 이용 설정을 확인해 주세요.", 503) from None
+
+    @staticmethod
+    def _validate_strict_source(source):
+        if not isinstance(source, dict) or set(source) - _SOURCE_FIELDS:
+            raise ValueError("Unknown source field")
+        for key in {"source_id", "title", "provider", "operator", "language", "document_type", "format", "checked_on"} & set(source):
+            if not isinstance(source[key], str) or not source[key].strip() or len(source[key]) > 1000:
+                raise ValueError("Invalid source metadata")
+        for key in ("allowed_hosts", "approved_urls"):
+            if key in source and (not isinstance(source[key], list) or not 1 <= len(source[key]) <= 1000):
+                raise ValueError("Invalid source URL scope")
+        for key in ("source_body_included", "is_synthetic"):
+            if key in source and type(source[key]) is not bool:
+                raise ValueError("Invalid source declaration")
+        if "url" in source and "canonical_url" in source:
+            if _normalize_url(source["url"]) != _normalize_url(source["canonical_url"]):
+                raise ValueError("Conflicting canonical URLs")
+
+    @staticmethod
+    def _validate_strict_review(review):
+        allowed = _REVIEW_FIELDS | {"version_scope", "allowed_actors", "version_id", "document_version_id"}
+        if (not isinstance(review, dict) or set(review) - allowed
+                or not (_REVIEW_FIELDS | {"version_scope", "allowed_actors"}).issubset(review)):
+            raise ValueError("Invalid action review schema")
+        _actor_list(review["allowed_actors"])
+        if review["version_scope"] not in {"SOURCE", "VERSION"}:
+            raise ValueError("Invalid version scope")
+        version = review.get("version_id", review.get("document_version_id"))
+        if "version_id" in review and "document_version_id" in review and review["version_id"] != review["document_version_id"]:
+            raise ValueError("Conflicting version identities")
+        if review["version_scope"] == "SOURCE" and version is not None:
+            raise ValueError("Source review cannot identify one version")
+        if review["version_scope"] == "VERSION" and (not isinstance(version, str) or not version.strip() or len(version) > 256):
+            raise ValueError("Version review needs an identity")
+        if any(not isinstance(review[key], str) or not review[key].strip() or len(review[key]) > 10000
+               for key in _REVIEW_FIELDS):
+            raise ValueError("Invalid review record values")
+        if date.fromisoformat(review["reviewed_on"]).isoformat() != review["reviewed_on"]:
+            raise ValueError("Invalid review date")
+
     def require_capability(self, actor, capability="DATA_MANAGER"):
-        if capability not in self._capabilities.get(actor, ()):
-            _deny()
+        with self._lock:
+            if not isinstance(actor, str) or capability not in self._capabilities.get(actor, ()):
+                _deny()
+
+    @property
+    def generation(self):
+        with self._lock:
+            return self._generation
+
+    @contextmanager
+    def read_guard(self):
+        """Fence policy changes until a local authorization transaction commits.
+
+        Callers acquire their RAG/index lock first, then this guard, and only
+        then open the database write transaction. No network or model call is
+        made here. The token is process-local and is not a persisted approval.
+        """
+        with self._lock:
+            yield self._generation
 
     def _put_source(self, source):
+        if self._strict:
+            self._validate_strict_source(source)
         value = copy.deepcopy(source)
         source_id = value.get("source_id")
         if not isinstance(source_id, str) or not source_id or len(source_id) > 128:
@@ -171,8 +312,11 @@ class SourcePolicy:
 
     def _put_review(self, review):
         value = copy.deepcopy(review)
-        required = {"source_id", "action", "status", "basis_type", "basis_url", "reviewed_on",
-                    "scope", "conditions", "user_scope", "processing_environment"}
+        if self._strict:
+            self._validate_strict_review(value)
+        if "allowed_actors" in value:
+            _actor_list(value["allowed_actors"])
+        required = _REVIEW_FIELDS
         if not required.issubset(value) or value["source_id"] not in self._registry:
             raise ValueError("Incomplete source review")
         if (value["action"] not in ACTIONS or value["status"] not in {"ALLOWED", "BLOCKED", "UNRESOLVED"}
@@ -194,11 +338,13 @@ class SourcePolicy:
             # A changed host/document registration requires a fresh action review.
             source_id = source["source_id"]
             self._reviews = {key: value for key, value in self._reviews.items() if key[0] != source_id}
+            self._generation += 1
 
     def set_review(self, actor, review):
         self.require_capability(actor)
         with self._lock:
             self._put_review(review)
+            self._generation += 1
 
     def source(self, source_id):
         with self._lock:
@@ -208,12 +354,19 @@ class SourcePolicy:
 
     def require(self, source_id, action, actor=None, version_id=None):
         with self._lock:
+            if self._strict and not _valid_actor(actor):
+                _deny("SOURCE_BLOCKED")
+            if not isinstance(source_id, str) or not isinstance(action, str) or (
+                    version_id is not None and not isinstance(version_id, str)):
+                _deny("SOURCE_BLOCKED")
             if action not in ACTIONS or source_id not in self._registry:
                 _deny("SOURCE_BLOCKED")
             review = self._reviews.get((source_id, version_id, action))
             if review is None:
                 review = self._reviews.get((source_id, None, action))
             if review is None or review["status"] != "ALLOWED":
+                _deny("SOURCE_BLOCKED")
+            if "allowed_actors" in review and actor not in review["allowed_actors"]:
                 _deny("SOURCE_BLOCKED")
             # A fact-only record cannot grant full-document or database processing.
             if review["basis_type"] == "FACT_ONLY" and action not in {"view_link", "display_excerpt"}:
@@ -384,9 +537,12 @@ class SafeFetcher:
         if not self.policy.network_enabled:
             _deny("NETWORK_DISABLED")
         self.policy.require(source_id, "fetch", actor, version_id)
-        limits = self._limits(self.policy.source(source_id))
         redirects, retries, current_url = 0, 0, url
         while True:
+            if not self.policy.network_enabled:
+                _deny("NETWORK_DISABLED")
+            self.policy.require(source_id, "fetch", actor, version_id)
+            limits = self._limits(self.policy.source(source_id))
             # Resolve afresh for every attempt and redirect. Transport uses these IPs.
             validated = validate_url(current_url, source_id, self.policy, self._resolver)
             with self._lock:
@@ -396,6 +552,9 @@ class SafeFetcher:
                         raise ServiceError("RETRY_LATER", "출처의 요청 간격 대기가 필요합니다.", 429, True)
                     self._sleep(delay)
                 self._last[validated.hostname] = self._clock()
+            # Rate/backoff waits and redirect responses never preserve a stale
+            # approval for the next outbound request.
+            self.policy.require(source_id, "fetch", actor, version_id)
             try:
                 status, headers, body = (self._transport(validated) if self._transport is not None
                                          else self._request(validated, limits))
@@ -405,6 +564,7 @@ class SafeFetcher:
                 retries += 1
                 self._sleep(2 ** (retries - 1))
                 continue
+            self.policy.require(source_id, "fetch", actor, version_id)
             headers = {key.lower(): value for key, value in headers.items()}
             if not isinstance(body, bytes) or len(body) > limits["bytes"]:
                 _deny("RESPONSE_TOO_LARGE")

@@ -408,8 +408,11 @@ class RagTests(unittest.TestCase):
                 return super().embed(texts)
 
         spy = SpyEmbeddings()
-        with self.assertRaises(ServiceError):
-            self.make_service(embeddings=spy)
+        disabled = self.make_service(embeddings=spy)
+        self.assertEqual(disabled.metadata_count, 0)
+        with self.assertRaises(ServiceError) as blocked:
+            disabled.prepare_metadata("manager")
+        self.assertEqual(blocked.exception.code, "MODEL_REMOTE_BLOCKED")
         self.assertEqual(spy.calls, 0)
         metadata_source = self.catalog.items[0]["source_id"]
         self.policy.register_source("manager", {"source_id": metadata_source, "url": self.catalog.sources[metadata_source]["url"]})
@@ -420,6 +423,7 @@ class RagTests(unittest.TestCase):
             source_policy=self.policy, index_actor="manager", embeddings=spy)
         self.addCleanup(remote.close)
         self.document()
+        remote.prepare_metadata("manager")
         self.assertEqual(remote.prepare("buyer", self.item)["status"], "COMPLETED")
         calls = spy.calls
         self.policy.set_review("manager", {**review, "status": "BLOCKED"})

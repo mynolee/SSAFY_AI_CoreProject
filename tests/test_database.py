@@ -74,8 +74,8 @@ class DatabaseTests(unittest.TestCase):
             self.assertIs(connection.row_factory, sqlite3.Row)
             self.assertEqual(connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
             self.assertEqual(connection.execute("PRAGMA busy_timeout").fetchone()[0], 2000)
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 5)
-            self.assertEqual(connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 5)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 6)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], 6)
             self.assertEqual(connection.execute("SELECT available FROM demo_wallets WHERE user_id='buyer'").fetchone()[0], 123)
             self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
         finally:
@@ -106,7 +106,7 @@ class DatabaseTests(unittest.TestCase):
             upgraded.initialize()
             upgraded.initialize()
             with upgraded.connect() as connection:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 5)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 6)
                 self.assertEqual(connection.execute("SELECT available FROM demo_wallets WHERE user_id='buyer'").fetchone()[0], 987)
                 self.assertIn("review_id", [r["name"] for r in connection.execute("PRAGMA table_info(contract_revisions)")])
                 self.assertIn("user_scope", [r["name"] for r in connection.execute("PRAGMA table_info(source_action_reviews)")])

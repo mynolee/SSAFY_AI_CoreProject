@@ -64,14 +64,28 @@ class LocalVectorStore:
         self.docs = self.client.get_or_create_collection("warranty_docs" + suffix,
             metadata={"hnsw:space": "cosine", "embedding_model": self.embeddings.name}, embedding_function=None)
 
-    def index_metadata(self, records: list[dict[str, Any]]) -> int:
+    def metadata_matches(self, records: list[dict[str, Any]], dataset_hash: str) -> bool:
+        """Check a prepared catalog without invoking an embedding provider."""
+        expected = {str(record["item_id"]): record["text"] for record in records}
+        if len(expected) != len(records) or self.meta.count() != len(expected):
+            return False
+        rows = self.meta.get(include=["documents", "metadatas"])
+        actual = {key: (text, metadata) for key, text, metadata in
+                  zip(rows["ids"], rows["documents"], rows["metadatas"])}
+        return set(actual) == set(expected) and all(
+            actual[key][0] == text and actual[key][1].get("dataset_hash") == dataset_hash
+            for key, text in expected.items())
+
+    def index_metadata(self, records: list[dict[str, Any]], dataset_hash: str | None = None) -> int:
         ids = [str(record["item_id"]) for record in records]
         if len(ids) != len(set(ids)):
             raise ServiceError("MODEL_OUTPUT_INVALID", "Duplicate catalog identity.", 409, False)
         if records:
             texts = [record["text"] for record in records]
             self.meta.upsert(ids=ids, documents=texts, embeddings=self.embeddings.embed(texts),
-                metadatas=[{"item_id": value, "source_type": "metadata"} for value in ids])
+                metadatas=[{"item_id": value, "source_type": "metadata",
+                            **({"dataset_hash": dataset_hash} if dataset_hash is not None else {})}
+                           for value in ids])
         old_ids = self.meta.get(include=[])['ids']
         stale = [value for value in old_ids if value not in set(ids)]
         if stale:

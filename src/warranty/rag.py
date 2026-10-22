@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import copy
-from contextlib import closing
+from contextlib import closing, nullcontext, contextmanager
 import json
 from pathlib import Path
 import re
@@ -11,7 +11,7 @@ import time
 from typing import Any, TypedDict
 import uuid
 
-from .documents import (DocumentRegistry, OWN_ROLES, APPLICABILITY_FIELDS,
+from .documents import (DocumentRegistry, OWN_ROLES, ROLES, APPLICABILITY_FIELDS,
                         applicability_issues, canonical_json, chunk_sections, digest, now, normalize)
 from .errors import ServiceError
 from .prompts import PromptStore, StructuredRunner, MockStructuredModel, validate_output
@@ -40,6 +40,10 @@ class GraphState(TypedDict, total=False):
     revision: str | None
     selection: dict
     collection_cache_hits: int
+    allow_collection: bool
+    use_answer_cache: bool
+    retrieval_pairs: list
+    retrieval_elapsed_seconds: float
 
 
 def _error(code, message, retryable=False):
@@ -49,7 +53,8 @@ def _error(code, message, retryable=False):
 class RagService:
     def __init__(self, catalog, db, settings, *, model=None, prompt_store=None,
                  source_policy=None, fetcher=None, embeddings=None, chunk_size=1000,
-                 chunk_overlap=200, index_actor=None):
+                 chunk_overlap=200, index_actor=None, collector=None, document_jobs=None,
+                 default_top_k=6, default_strategy="similarity", mmr_fetch_k=30, mmr_lambda_mult=0.5):
         self.catalog, self.db, self.settings = catalog, db, settings
         self.model = model or MockStructuredModel()
         self.prompt_store = prompt_store or PromptStore(settings.config_dir)
@@ -57,33 +62,81 @@ class RagService:
         self.registry = DocumentRegistry(catalog, db, settings, source_policy, fetcher)
         self.documents = self.registry
         self.index_actor = index_actor
+        self.collector, self.document_jobs = collector, document_jobs
+        if (type(default_top_k) is not int or not 1 <= default_top_k <= 30 or
+                default_strategy not in {"similarity", "mmr"} or type(mmr_fetch_k) is not int or
+                not default_top_k <= mmr_fetch_k <= 100 or isinstance(mmr_lambda_mult, bool) or
+                not isinstance(mmr_lambda_mult, (int, float)) or not 0 <= mmr_lambda_mult <= 1):
+            raise ServiceError("INVALID_INPUT", "Invalid retrieval configuration.", 422, False)
+        self.default_top_k, self.default_strategy = default_top_k, default_strategy
+        self.mmr_fetch_k, self.mmr_lambda_mult = mmr_fetch_k, mmr_lambda_mult
         self.chunk_size, self.chunk_overlap = chunk_size, chunk_overlap
         chunk_sections([], chunk_size, chunk_overlap)
         self.chunk_config_hash = digest({"size": chunk_size, "overlap": chunk_overlap})
-        if embeddings is not None:
-            if not isinstance(getattr(embeddings, "is_remote", None), bool):
-                raise ServiceError("MODEL_REMOTE_BLOCKED", "The embedding adapter must declare its processing location.", 503, False)
-            if embeddings.is_remote:
-                if not settings.remote_models:
-                    raise ServiceError("MODEL_REMOTE_BLOCKED", "Remote embeddings are disabled.", 503, False)
-                for source_id in {item.get("source_id", "") for item in catalog.items}:
-                    self.registry._require(source_id, "external_process")
-        self.vectors = LocalVectorStore(Path(settings.data_dir) / "chroma", embeddings)
-        self._lock = threading.RLock()
         self._metadata_records = []
         for item in catalog.items:
             clean = {key: value for key, value in item.items() if key != "readiness"}
             self._metadata_records.append({"item_id": str(item["item_id"]), "text": item.get("index_text", canonical_json(clean))})
         self.dataset_hash = getattr(catalog, "dataset_hash", digest(self._metadata_records))
+        if embeddings is not None:
+            if not isinstance(getattr(embeddings, "is_remote", None), bool):
+                raise ServiceError("MODEL_REMOTE_BLOCKED", "The embedding adapter must declare its processing location.", 503, False)
+        self.vectors = LocalVectorStore(Path(settings.data_dir) / "chroma", embeddings)
+        self._lock = threading.RLock()
         with self.db.transaction() as connection:
             for item in catalog.items:
                 connection.execute("INSERT OR IGNORE INTO items(item_id,name,provider) VALUES(?,?,?)",
                     (item["item_id"], item.get("name", item["item_id"]), item.get("provider", "UNKNOWN")))
-        self.metadata_count = self.vectors.index_metadata(self._metadata_records)
+        if self.vectors.embeddings.is_remote:
+            matches = getattr(self.vectors, "metadata_matches", None)
+            self.metadata_count = self.vectors.meta.count() if callable(matches) and matches(self._metadata_records, self.dataset_hash) else 0
+        else:
+            self.metadata_count = self.vectors.index_metadata(self._metadata_records)
         self.graph = self._build_graph()
+
+    def prepare_metadata(self, actor):
+        """Explicit metadata indexing; constructing a remote app makes no paid call."""
+        self.registry.policy.require_capability(actor, "DATA_MANAGER")
+        sources = sorted({item.get("source_id", "") for item in self.catalog.items})
+        if self.vectors.embeddings.is_remote:
+            if not self.settings.remote_models:
+                raise ServiceError("MODEL_REMOTE_BLOCKED", "Remote embeddings are disabled.", 503, False)
+            for source_id in sources:
+                self.registry._require(source_id, "external_process", actor, self.dataset_hash)
+        with self._embedding_context([{"kind": "metadata", "source_id": source,
+                "version_id": self.dataset_hash, "actor": actor} for source in sources]):
+            self.metadata_count = self.vectors.index_metadata(self._metadata_records, dataset_hash=self.dataset_hash)
+        return {"status": "META_READY", "metadata_count": self.metadata_count, "dataset_hash": self.dataset_hash,
+                "embedding_model": self.vectors.embeddings.name}
+
+    def _run_model(self, kind, variables, actor, item_id):
+        contextualize = getattr(self.model, "processing_context", None)
+        with contextualize(actor, item_id) if callable(contextualize) else nullcontext():
+            return self.runner.run(kind, variables)
+
+    def _embedding_context(self, contexts):
+        embeddings = self.vectors.embeddings
+        contextualize = getattr(embeddings, "processing_context", None)
+        if callable(contextualize):
+            return contextualize(contexts)
+        if embeddings.is_remote and not getattr(embeddings, "is_mock", False):
+            raise ServiceError("MODEL_REMOTE_BLOCKED", "Remote embedding processing context is unavailable.", 503, False)
+        return nullcontext()
+
+    def _query_context(self, item_id, actor):
+        return [{"kind": "question", "source_id": self.catalog.get(item_id).get("source_id", ""),
+                 "version_id": self.dataset_hash, "actor": actor}]
 
     def close(self):
         self.vectors.close()
+
+    @contextmanager
+    def review_guard(self):
+        """Fence source rights and local revision through a domain commit."""
+        with self._lock:
+            read_guard = getattr(self.registry.policy, "read_guard", None)
+            with read_guard() if callable(read_guard) else nullcontext():
+                yield
 
     def corpus_summary(self):
         with closing(self.db.connect()) as connection:
@@ -147,7 +200,43 @@ class RagService:
             connection.execute("UPDATE index_jobs SET " + ",".join(key + "=?" for key in values) + " WHERE job_id=?",
                                (*values.values(), job_id))
 
-    def prepare(self, user_id, item_id):
+    def enqueue_prepare(self, user_id, item_id, applicability=None, question=None):
+        self.catalog.get(item_id)
+        inputs = self._validate_inputs(applicability)
+        if self.document_jobs is None:
+            raise ServiceError("JOBS_UNAVAILABLE", "Document background processing is not configured.", 503, False)
+        question = self._preparation_question(question)
+        return self.document_jobs.enqueue(user_id, item_id, {"question": question, "applicability": inputs})
+
+    def retry_prepare(self, user_id, job_id):
+        if self.document_jobs is None:
+            raise ServiceError("JOBS_UNAVAILABLE", "Document background processing is not configured.", 503, False)
+        return self.document_jobs.retry(user_id, job_id)
+
+    def run_prepare(self, request, progress):
+        """Fixed queue handler. Queue claims, retries and fences all progress writes."""
+        if not isinstance(request, dict) or not all(isinstance(request.get(key), str) and request[key]
+                for key in ("job_id", "requester", "item_id")):
+            raise ServiceError("INVALID_INPUT", "Invalid document job request.", 422, False)
+        if request.get("dataset_hash", self.dataset_hash) != self.dataset_hash:
+            return {"status": "BLOCKED", "stage": "DOC_BLOCKED", "failure_code": "DATASET_CHANGED"}
+        return self._prepare(request["requester"], request["item_id"],
+            self._validate_inputs(request.get("applicability")), self._preparation_question(request.get("question")),
+            job_id=request["job_id"], progress=progress)
+
+    @staticmethod
+    def _preparation_question(question):
+        if question is None:
+            return "보증 이전 조건과 적용 계약 문서를 준비해 주세요."
+        if not isinstance(question, str) or not question.strip() or len(question) > 5000:
+            raise ServiceError("INVALID_INPUT", "A bounded preparation question is required.", 422, False)
+        return question.strip()
+
+    def prepare(self, user_id, item_id, applicability=None, question=None):
+        """Synchronous compatibility entry point; UIs enqueue persistent jobs."""
+        return self._prepare(user_id, item_id, self._validate_inputs(applicability), self._preparation_question(question))
+
+    def _prepare(self, user_id, item_id, inputs, question, *, job_id=None, progress=None, collect=True):
         """Request and execute a bounded local indexing job.
 
         The local worker only reads already registered/reviewed bodies. External
@@ -155,24 +244,52 @@ class RagService:
         The requesting user never gains the worker's manager capability.
         """
         self.catalog.get(item_id)
-        job_id = uuid.uuid4().hex
+        queued = job_id is not None
+        job_id = job_id or uuid.uuid4().hex
         stamp = now()
-        with self.db.transaction() as connection:
-            connection.execute("INSERT INTO index_jobs(job_id,requester,item_id,status,stage,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-                (job_id, user_id, item_id, "RUNNING", "CHECKING_DOCUMENTS", stamp, stamp))
+        if not queued:
+            with self.db.transaction() as connection:
+                connection.execute("INSERT INTO index_jobs(job_id,requester,item_id,status,stage,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                    (job_id, user_id, item_id, "RUNNING", "CHECKING_DOCUMENTS", stamp, stamp))
+        outcome = {"job_id": job_id, "item_id": item_id, "status": "RUNNING", "stage": "CHECKING_DOCUMENTS",
+                   "candidate_count": 0, "body_count": 0, "chunk_count": 0, "revision": None, "failure_code": None,
+                   "collection_elapsed_seconds": None, "index_elapsed_seconds": None}
+        def update(**fields):
+            outcome.update(fields)
+            if progress is not None:
+                progress(fields.get("stage", outcome["stage"]), **{key: value for key, value in fields.items()
+                    if key in {"candidate_count", "body_count", "chunk_count", "revision"}})
+            else:
+                self._job_update(job_id, **fields)
         with self._lock:
             revision = None
+            index_started = None
             try:
+                if collect and self.collector is not None:
+                    collection_started = time.perf_counter()
+                    try:
+                        prepared = self._source_pipeline(user_id, item_id, question, inputs,
+                            progress=lambda stage, **counts: update(stage=stage, **counts))
+                    finally:
+                        outcome["collection_elapsed_seconds"] = time.perf_counter() - collection_started
+                    if prepared["collection_status"] in {"FAILED", "BLOCKED"}:
+                        first = prepared["collection_errors"][0] if prepared["collection_errors"] else {}
+                        raise ServiceError(first.get("code", "FETCH_FAILED"), "Approved document collection could not complete.", 409, True)
+                index_started = time.perf_counter()
                 own = self.registry.candidates(item_id)
-                self._job_update(job_id, candidate_count=len(own))
+                update(stage="CHECKING_DOCUMENTS", candidate_count=len(own))
                 if not any(candidate["own_document"] for candidate in own):
                     raise ServiceError("OWN_DOCUMENT_MISSING", "No approved document belonging to this item is available.", 409, False)
                 actor = self.index_actor or user_id
                 self.registry.policy.require_capability(actor, "DATA_MANAGER")
+                if self.vectors.embeddings.is_remote and not self.settings.remote_models:
+                    raise ServiceError("MODEL_REMOTE_BLOCKED", "Remote embeddings are disabled.", 503, False)
+                if self.vectors.embeddings.is_remote and self.metadata_count != len(self._metadata_records):
+                    raise ServiceError("INDEX_EMPTY", "Prepare the metadata index before document embeddings.", 409, False)
                 candidates = self.registry.candidates()
                 chunks = []
                 versions = []
-                self._job_update(job_id, stage="PARSING_STORED_BODIES")
+                update(stage="PARSING_STORED_BODIES")
                 for candidate in candidates:
                     try:
                         sections = self.registry.sections(candidate, actor)
@@ -180,7 +297,7 @@ class RagService:
                         self.registry._require(candidate["source_id"], "display_excerpt", actor, candidate["version_id"])
                         if self.vectors.embeddings.is_remote:
                             self.registry._require(candidate["source_id"], "external_process", actor, candidate["version_id"])
-                            self.registry._require(self.catalog.get(candidate["item_id"]).get("source_id", ""), "external_process", actor)
+                            self.registry._require(self.catalog.get(candidate["item_id"]).get("source_id", ""), "external_process", actor, self.dataset_hash)
                     except ServiceError:
                         if candidate["item_id"] == item_id and candidate["own_document"]:
                             raise
@@ -206,14 +323,22 @@ class RagService:
                     previous = connection.execute("SELECT revision FROM index_manifests WHERE active=1").fetchone()
                 obsolete_revision = previous["revision"] if previous else None
                 if not active or active["revision"] != revision:
-                    self._job_update(job_id, stage="INDEXING", body_count=len({candidate["version_id"] for candidate in own}))
-                    self.vectors.stage_documents(revision, chunks)
+                    update(stage="INDEXING", body_count=len({candidate["version_id"] for candidate in own}))
+                    with self._embedding_context([{"kind": "document", "source_id": source,
+                            "version_id": version, "actor": actor}
+                            for source, version in sorted({(chunk["source_id"], chunk["version_id"]) for chunk in chunks})]):
+                        self.vectors.stage_documents(revision, chunks)
                     # Verify item filters before exposing a new revision.
                     for linked_item in set(chunk["item_id"] for chunk in chunks):
-                        if not self.vectors.search(linked_item, revision, linked_item, 1):
+                        with self._embedding_context(self._query_context(linked_item, actor)):
+                            found = self.vectors.search(linked_item, revision, linked_item, 1)
+                        if not found:
                             raise ServiceError("INDEX_EMPTY", "Retrieval validation of the prepared revision failed.", 503, True)
                     self.registry.policy.require_capability(actor, "DATA_MANAGER")
                     with self.db.transaction() as connection:
+                        checker = getattr(progress, "check", None)
+                        if callable(checker):
+                            checker(connection)
                         connection.execute("UPDATE index_manifests SET active=0 WHERE active=1")
                         connection.execute("INSERT INTO index_manifests(revision,dataset_hash,version_ids_json,embedding_model,dimension,chunk_config_hash,success_count,failure_count,activated_at,active) VALUES(?,?,?,?,?,?,?,?,?,1) ON CONFLICT(revision) DO UPDATE SET active=1,activated_at=excluded.activated_at",
                             (revision, self.dataset_hash, canonical_json(sorted(set(versions))), self.vectors.embeddings.name,
@@ -224,19 +349,28 @@ class RagService:
                         with self.db.transaction() as connection:
                             if not connection.execute("SELECT 1 FROM index_manifests WHERE revision=? AND active=1", (obsolete_revision,)).fetchone():
                                 self.vectors.discard_revision(obsolete_revision)
-                self._job_update(job_id, status="COMPLETED", stage="INDEX_READY", body_count=len({candidate["version_id"] for candidate in own}),
+                update(status="COMPLETED", stage="INDEX_READY", body_count=len({candidate["version_id"] for candidate in own}),
                     chunk_count=sum(chunk["item_id"] == item_id for chunk in chunks), revision=revision)
+                if collect and self.collector is not None:
+                    self.collector.mark_indexed(prepared["collection_result"], revision)
             except ServiceError as exc:
-                if revision and (not self._active() or self._active()["revision"] != revision):
-                    self.vectors.discard_revision(revision)
-                self._job_update(job_id, status="BLOCKED", stage="DOC_BLOCKED", failure_code=exc.code)
+                # Staging IDs are shared by identical deterministic revisions.
+                # A failed/stale worker must not delete another worker's rows.
+                # Unpublished rows remain hidden and are reused on a retry.
+                update(status="BLOCKED", stage="DOC_BLOCKED", failure_code=exc.code)
             except Exception:
-                if revision and (not self._active() or self._active()["revision"] != revision):
-                    self.vectors.discard_revision(revision)
-                self._job_update(job_id, status="FAILED", stage="INDEXING", failure_code="INDEX_EMPTY")
-        return self.job(user_id, job_id)
+                update(status="FAILED", stage="INDEXING", failure_code="INDEX_EMPTY")
+            finally:
+                if index_started is not None:
+                    outcome["index_elapsed_seconds"] = time.perf_counter() - index_started
+        if queued:
+            return outcome
+        return {**self.job(user_id, job_id), "collection_elapsed_seconds": outcome["collection_elapsed_seconds"],
+                "index_elapsed_seconds": outcome["index_elapsed_seconds"]}
 
     def job(self, user_id, job_id):
+        if self.document_jobs is not None:
+            return self.document_jobs.job(user_id, job_id)
         with closing(self.db.connect()) as connection:
             row = connection.execute("SELECT * FROM index_jobs WHERE job_id=?", (job_id,)).fetchone()
         if row is None:
@@ -245,28 +379,115 @@ class RagService:
             self.registry.policy.require_capability(user_id, "DATA_MANAGER")
         return dict(row)
 
-    def _retrieve(self, state):
-        item = self.catalog.get(state["item_id"])
+    def _source_pipeline(self, user_id, item_id, question, inputs, *, progress=None, allow_collection=True):
+        """Query -> discover -> select -> fetch, all inside the retrieve service.
+
+        Discovery yields registered targets, including own documents with no
+        body yet. The model only selects IDs; the collector rechecks its trusted
+        inventory before it can fetch or establish an item/version link.
+        """
+        emit = progress or (lambda stage, **counts: None)
+        item = self.catalog.get(item_id)
         if not getattr(self.model, "is_mock", False):
             if not self.settings.remote_models:
                 raise ServiceError("KEY_MISSING", "Remote model processing is disabled.", 503, False)
-            self.registry._require(item.get("source_id", ""), "external_process", state["user_id"])
-        inputs = state["applicability_inputs"]
-        query = self.runner.run("query", {"item": item, "question": state["question"], "applicability": inputs})
-        candidates = self.registry.candidates(state["item_id"])
+            self.registry._require(item.get("source_id", ""), "external_process", user_id, self.dataset_hash)
+        emit("QUERYING")
+        query = self._run_model("query", {"item": item, "question": question, "applicability": inputs}, user_id, item_id)
+        existing = self.registry.candidates(item_id)
+        discovered = []
+        if self.collector is not None and allow_collection:
+            emit("DISCOVERING")
+            discovered = self.collector.discover(item_id, question, query["queries"], inputs, user_id)
+            if not isinstance(discovered, list) or len(discovered) > 100:
+                raise ServiceError("SOURCE_BLOCKED", "Registered candidate discovery returned an invalid result.", 422, False)
+        by_id = {candidate["id"]: candidate for candidate in existing}
+        discovery_ids = set()
+        for candidate in discovered:
+            if (not isinstance(candidate, dict) or not all(isinstance(candidate.get(key), str) and candidate[key]
+                    for key in ("id", "source_id", "title", "role")) or candidate["role"] not in ROLES or
+                    candidate.get("item_id", item_id) != item_id or candidate["id"] in discovery_ids or
+                    type(candidate.get("own_document")) is not bool):
+                raise ServiceError("SOURCE_BLOCKED", "Registered candidate identity validation failed.", 422, False)
+            prior = by_id.get(candidate["id"])
+            if prior and (prior["source_id"] != candidate["source_id"] or prior["role"] != candidate["role"] or
+                    prior["version_id"] != candidate.get("version_id") or prior["canonical_url"] != candidate.get("url")):
+                raise ServiceError("SOURCE_BLOCKED", "Registered candidate identities conflict.", 403, False)
+            self.registry.policy.source(candidate["source_id"])
+            discovery_ids.add(candidate["id"])
+            by_id[candidate["id"]] = {**(prior or {}), **candidate}
+        candidates = list(by_id.values())
         if not getattr(self.model, "is_mock", False):
             for candidate in candidates:
-                self.registry._require(candidate["source_id"], "external_process", state["user_id"], candidate["version_id"])
+                self.registry._require(candidate["source_id"], "external_process", user_id, candidate.get("version_id"))
+        emit("SELECTING", candidate_count=len(candidates))
         public_candidates = [{"id": candidate["id"], "title": candidate["title"], "role": candidate["role"],
                               "own_document": candidate["own_document"]} for candidate in candidates]
-        selection = self.runner.run("selection", {"item": item, "question": state["question"],
-            "applicability": inputs, "candidates": public_candidates})
+        selection = self._run_model("selection", {"item": item, "question": question,
+            "applicability": inputs, "candidates": public_candidates}, user_id, item_id)
         validate_output("selection", selection, allowed_candidate_ids={candidate["id"] for candidate in candidates})
-        # Candidate selection never removes an item's own registered document.
         selected = set(selection["selected_candidate_ids"]) | {candidate["id"] for candidate in candidates if candidate["own_document"]}
+        collected = {"status": "INDEXED", "linked": [], "cache_hits": 0, "errors": []}
+        if self.collector is not None and allow_collection:
+            emit("FETCHING", candidate_count=len(discovered))
+            collected = self.collector.collect(item_id, question, query["queries"], inputs, user_id,
+                selected_candidate_ids=sorted(selected & discovery_ids), candidates=discovered)
+            if (not isinstance(collected, dict) or collected.get("status") not in
+                    {"FETCHED", "INDEXED", "FAILED", "BLOCKED", "NO_RESULTS"} or
+                    not isinstance(collected.get("linked", []), list)):
+                raise ServiceError("FETCH_FAILED", "Document collection returned an invalid result.", 503, False)
+        post = self.registry.candidates(item_id)
+        selected_post = {candidate["id"] for candidate in post if candidate["id"] in selected or candidate["own_document"]}
+        for link in collected.get("linked", []):
+            origin = by_id.get(link.get("candidate_id")) if isinstance(link, dict) else None
+            if (origin is None or origin["id"] not in selected or link.get("item_id") != item_id or
+                    link.get("role") != origin["role"]):
+                raise ServiceError("SOURCE_BLOCKED", "A collected version does not belong to this candidate selection.", 403, False)
+            matches = [candidate for candidate in post if candidate["version_id"] == link.get("version_id") and
+                candidate["role"] == link["role"] and candidate["source_id"] == origin["source_id"] and
+                candidate["canonical_url"] == origin.get("url", origin.get("canonical_url")) and
+                candidate["document_id"] == origin.get("document_id")]
+            if not matches:
+                raise ServiceError("SOURCE_BLOCKED", "A collected version failed its item and source boundary.", 403, False)
+            selected_post.update(candidate["id"] for candidate in matches)
+        safe_errors = []
+        for error in collected.get("errors", []):
+            code = error.get("code") if isinstance(error, dict) else None
+            if code not in {"SOURCE_BLOCKED", "OWN_DOCUMENT_MISSING", "FETCH_FAILED", "PARSE_FAILED", "NO_RESULTS", "FORBIDDEN", "APPLICABILITY_UNKNOWN", "INDEX_EMPTY"}:
+                code = "FETCH_FAILED"
+            safe_errors.append(_error(code, "An approved source could not be prepared.", code in {"FETCH_FAILED", "NO_RESULTS", "INDEX_EMPTY"}))
+        return {"query": query, "selection": selection, "candidates": post, "selected": selected_post,
+            "discovered_count": len(discovered), "collection_result": collected,
+            "collection_status": collected["status"], "collection_errors": safe_errors,
+            "collection_cache_hits": collected.get("cache_hits", 0)}
+
+    def _retrieve(self, state):
+        item = self.catalog.get(state["item_id"])
+        inputs = state["applicability_inputs"]
+        allow_collection = state.get("allow_collection", True)
+        pipeline = self._source_pipeline(state["user_id"], state["item_id"], state["question"], inputs,
+                                         allow_collection=allow_collection)
+        query, selection = pipeline["query"], pipeline["selection"]
+        candidates, selected = pipeline["candidates"], pipeline["selected"]
         missing = list(dict.fromkeys(query["missing_information"] + selection["missing_information"]))
         conflicts = list(selection["conflicts"])
-        errors = []
+        errors = list(pipeline["collection_errors"])
+        if pipeline["collection_status"] in {"FAILED", "BLOCKED"}:
+            missing.append("approved_collection:required_document_unavailable")
+        if self.collector is not None and allow_collection and pipeline["collection_status"] not in {"FAILED", "BLOCKED"}:
+            active = self._active()
+            revision = active["revision"] if active else None
+            needs_index = any(candidate["id"] in selected and not self.vectors.has_document(
+                state["item_id"], revision, candidate["version_id"], candidate["role"]) for candidate in candidates)
+            if needs_index:
+                indexed = self._prepare(state["user_id"], state["item_id"], inputs, state["question"], collect=False)
+                if indexed["status"] != "COMPLETED":
+                    missing.append("approved_collection:index_required")
+                    errors.append(_error(indexed.get("failure_code") or "INDEX_EMPTY", "The collected document index is not ready.", True))
+            active = self._active()
+            if (active and pipeline["collection_status"] in {"FETCHED", "INDEXED"} and selected and
+                    (not needs_index or indexed["status"] == "COMPLETED")):
+                self.collector.mark_indexed(pipeline["collection_result"], active["revision"])
         manifest = self._active()
         revision = manifest["revision"] if manifest else None
         active_versions = set(json.loads(manifest["version_ids_json"])) if manifest else set()
@@ -294,10 +515,17 @@ class RagService:
         if self.vectors.embeddings.is_remote:
             if not self.settings.remote_models:
                 raise ServiceError("MODEL_REMOTE_BLOCKED", "Remote embeddings are disabled.", 503, False)
-            self.registry._require(item.get("source_id", ""), "external_process", state["user_id"])
+            self.registry._require(item.get("source_id", ""), "external_process", state["user_id"], self.dataset_hash)
             for candidate in usable:
                 self.registry._require(candidate["source_id"], "external_process", state["user_id"], candidate["version_id"])
-        chunks = self.vectors.search(state["item_id"], revision, state["question"], state["top_k"], state["strategy"], allowed_pairs=allowed_pairs) if revision else []
+        ranking_start = time.perf_counter()
+        if revision:
+            with self._embedding_context(self._query_context(state["item_id"], state["user_id"])):
+                chunks = self.vectors.search(state["item_id"], revision, state["question"], state["top_k"], state["strategy"],
+                    fetch_k=self.mmr_fetch_k, lambda_mult=self.mmr_lambda_mult, allowed_pairs=allowed_pairs)
+        else:
+            chunks = []
+        ranking_elapsed = time.perf_counter() - ranking_start
         trusted = {(candidate["version_id"], candidate["role"]): candidate for candidate in usable}
         safe_chunks = []
         for chunk in chunks:
@@ -324,7 +552,8 @@ class RagService:
         # Cache collection identity independently from the question; no network
         # call is ever made by this lookup. Stored body reuse survives failures.
         collection_cache_hits = 0
-        for source_id in {candidate["source_id"] for candidate in candidates}:
+        cache_sources = {candidate["source_id"] for candidate in candidates} if state.get("use_answer_cache", True) else set()
+        for source_id in cache_sources:
             cache_key = digest([source_id, state["item_id"], inputs,
                                 sorted(normalize(term).casefold() for term in query["queries"]),
                                 sorted(candidate["version_id"] for candidate in candidates)])
@@ -335,12 +564,17 @@ class RagService:
             else:
                 self._cache_put("collection", cache_key, expected_status,
                     {"candidate_ids": sorted(selected), "version_ids": sorted(active_versions)}, ttl=None if candidates else 60)
+        if self.collector is not None and allow_collection:
+            hits = pipeline["collection_cache_hits"]
+            collection_cache_hits = hits if type(hits) is int and hits >= 0 else 0
         return {"item_context": item, "queries": query["queries"], "candidate_ids": sorted(selected),
             "selection": selection, "retrieved_chunks": chunks, "evidence_map": {entry["evidence_id"]: entry for entry in evidence},
             "missing_information": list(dict.fromkeys(missing)), "conflicts": list(dict.fromkeys(conflicts)),
             "readiness": {"status": status, "reasons": list(dict.fromkeys(error["code"] for error in errors))},
             "errors": errors, "revision": revision,
             "collection_cache_hits": collection_cache_hits,
+            "retrieval_pairs": sorted(allowed_pairs),
+            "retrieval_elapsed_seconds": ranking_elapsed,
             "progress": [{"stage": "RETRIEVING", "status": "COMPLETED"}, {"stage": "GENERATING", "status": "RUNNING"}]}
 
     def _generate(self, state):
@@ -359,14 +593,16 @@ class RagService:
             normalize(state["question"]).casefold(), state["revision"], self.vectors.embeddings.name,
             self.chunk_config_hash, getattr(self.model, "model_id", type(self.model).__name__),
             self.prompt_store.load("answer"), variables["evidence"], state["missing_information"], state["conflicts"]])
-        cached = self._cache_get("answer", cache_key)
+        use_cache = state.get("use_answer_cache", True)
+        cached = self._cache_get("answer", cache_key) if use_cache else None
         if cached:
             answer = cached["value"]
         else:
             try:
-                answer = self.runner.run("answer", variables)
+                answer = self._run_model("answer", variables, state["user_id"], state["item_id"])
             except ServiceError:
-                self._cache_put("answer", cache_key, "FAILED", {})
+                if use_cache:
+                    self._cache_put("answer", cache_key, "FAILED", {})
                 raise
         validate_output("answer", answer, allowed_evidence_ids=set(evidence_map))
         numbers = {evidence_map[eid]["number"] for eid in answer["cited_evidence_ids"]}
@@ -380,7 +616,7 @@ class RagService:
                        and evidence_map[eid]["role"] in {"SERVICE_TERMS", "INSURANCE_TERMS", "TRANSFER_GUIDE"}
                        for eid in condition["evidence_ids"]):
                 raise ServiceError("MODEL_OUTPUT_INVALID", "A condition requires applicable document evidence.", 422, False)
-        if not cached:
+        if not cached and use_cache:
             self._cache_put("answer", cache_key, "INDEXED", answer)
         transfer_evidence = [evidence_map[eid] for eid in answer["cited_evidence_ids"]
             if evidence_map[eid]["source_type"] in {"official_document", "synthetic_document"}
@@ -401,28 +637,94 @@ class RagService:
         return {"answer": answer, "cited_evidence_ids": answer["cited_evidence_ids"],
                 "progress": [{"stage": "RETRIEVING", "status": "COMPLETED"}, {"stage": "GENERATING", "status": "COMPLETED"}]}
 
-    def retrieve_evidence(self, user_id, item_id, question, applicability=None, top_k=6, strategy="similarity"):
-        """Actual retrieval callback for private evaluation, without generation."""
-        self.catalog.get(item_id)
-        if not isinstance(question, str) or not question.strip() or len(question) > 5000:
-            raise ServiceError("INVALID_INPUT", "A bounded question is required.", 422, False)
-        if isinstance(top_k, bool) or not isinstance(top_k, int) or not 1 <= top_k <= 30 or strategy not in {"similarity", "mmr"}:
+    def _retrieval_settings(self, top_k, strategy):
+        top_k = self.default_top_k if top_k is None else top_k
+        strategy = self.default_strategy if strategy is None else strategy
+        if type(top_k) is not int or not 1 <= top_k <= 30 or strategy not in {"similarity", "mmr"}:
             raise ServiceError("INVALID_INPUT", "Invalid retrieval settings.", 422, False)
-        state = self._retrieve({"user_id": user_id, "item_id": item_id, "question": question,
-            "applicability_inputs": self._validate_inputs(applicability), "top_k": top_k, "strategy": strategy})
-        return {"evidence": list(state["evidence_map"].values()), "revision": state["revision"],
-            "readiness": state["readiness"], "queries": state["queries"], "selection": state["selection"],
-            "missing_information": state["missing_information"], "conflicts": state["conflicts"]}
+        return top_k, strategy
 
-    def ask(self, user_id, item_id, question, applicability=None, top_k=6, strategy="similarity"):
+    def evaluation_context(self, user_id, item_id, question, applicability=None, top_k=None, strategy=None,
+                           *, allow_collection=False, cache=False, collection=None):
+        """Fresh model query/selection over a frozen corpus; no answer generation."""
+        self.catalog.get(item_id)
+        if (not isinstance(user_id, str) or not user_id or not isinstance(question, str) or
+                not question.strip() or len(question) > 5000):
+            raise ServiceError("INVALID_INPUT", "A bounded question is required.", 422, False)
+        if collection is not None:
+            allow_collection = collection
+        if type(allow_collection) is not bool or type(cache) is not bool:
+            raise ServiceError("INVALID_INPUT", "Invalid evaluation settings.", 422, False)
+        top_k, strategy = self._retrieval_settings(top_k, strategy)
+        state = self._retrieve({"user_id": user_id, "item_id": item_id, "question": question,
+            "applicability_inputs": self._validate_inputs(applicability), "top_k": top_k, "strategy": strategy,
+            "allow_collection": allow_collection, "use_answer_cache": cache})
+        return {"item": state["item_context"], "evidence": list(state["evidence_map"].values()), "revision": state["revision"],
+            "readiness": state["readiness"], "queries": state["queries"], "selection": state["selection"],
+            "missing_information": state["missing_information"], "conflicts": state["conflicts"], "errors": state["errors"],
+            "retrieval_elapsed_seconds": state["retrieval_elapsed_seconds"],
+            "retrieval_filters": {"item_id": item_id, "revision": state["revision"], "allowed_pairs": state["retrieval_pairs"]}}
+
+    def retrieve_evidence(self, user_id, item_id, question, applicability=None, top_k=None, strategy=None):
+        return self.evaluation_context(user_id, item_id, question, applicability, top_k, strategy,
+                                       allow_collection=False, cache=False)
+
+    def compare_retrieval(self, user_id, item_id, question, applicability=None, top_k=None):
+        """Similarity/MMR share one actual query/selection and identical filters."""
+        top_k, _ = self._retrieval_settings(top_k, "similarity")
+        common_start = time.perf_counter()
+        context = self.evaluation_context(user_id, item_id, question, applicability, top_k, "similarity",
+                                          allow_collection=False, cache=False)
+        common_elapsed = time.perf_counter() - common_start - context["retrieval_elapsed_seconds"]
+        revision = context["revision"]
+        pairs = {tuple(pair) for pair in context["retrieval_filters"]["allowed_pairs"]}
+        candidates = {(candidate["version_id"], candidate["role"]): candidate for candidate in self.registry.candidates(item_id)}
+        for pair in pairs:
+            candidate = candidates.get(pair)
+            if candidate is None:
+                raise ServiceError("SOURCE_BLOCKED", "The evaluation candidate scope changed.", 409, False)
+            for action in ("local_embed", "display_excerpt"):
+                self.registry._require(candidate["source_id"], action, user_id, candidate["version_id"])
+            if self.vectors.embeddings.is_remote:
+                self.registry._require(candidate["source_id"], "external_process", user_id, candidate["version_id"])
+        active = self._active()
+        if revision and (not active or active["revision"] != revision):
+            raise ServiceError("INDEX_EMPTY", "The evaluation revision changed.", 409, True)
+        ranking_start = time.perf_counter()
+        if revision:
+            if self.vectors.embeddings.is_remote:
+                self.registry._require(self.catalog.get(item_id).get("source_id", ""), "external_process", user_id, self.dataset_hash)
+            with self._embedding_context(self._query_context(item_id, user_id)):
+                ranked = self.vectors.search(item_id, revision, question, top_k, "mmr", fetch_k=self.mmr_fetch_k,
+                    lambda_mult=self.mmr_lambda_mult, allowed_pairs=pairs)
+        else:
+            ranked = []
+        mmr_elapsed = time.perf_counter() - ranking_start
+        for chunk in ranked:
+            candidate = candidates.get((chunk.get("version_id"), chunk.get("role")))
+            expected_type = "synthetic_document" if candidate and json.loads(candidate["review_json"]).get("is_synthetic", False) else "official_document"
+            if (not candidate or chunk.get("item_id") != item_id or chunk.get("revision") != revision or
+                    chunk.get("source_id") != candidate["source_id"] or chunk.get("url") != candidate["canonical_url"] or
+                    chunk.get("source_type") != expected_type):
+                raise ServiceError("MODEL_EVIDENCE_INVALID", "Evaluation evidence crossed its corpus boundary.", 409, False)
+        active = self._active()
+        if revision and (not active or active["revision"] != revision):
+            raise ServiceError("INDEX_EMPTY", "The evaluation revision changed.", 409, True)
+        return {**context, "similarity": [entry for entry in context["evidence"] if entry["source_type"] != "metadata"], "mmr": ranked,
+            "ranking_elapsed_seconds": {"similarity": context["retrieval_elapsed_seconds"], "mmr": mmr_elapsed},
+            "common_context_elapsed_seconds": max(0.0, common_elapsed)}
+
+    def ask(self, user_id, item_id, question, applicability=None, top_k=None, strategy=None, *, cache=True, allow_collection=True):
         self.catalog.get(item_id)
         if not isinstance(user_id, str) or not user_id or not isinstance(question, str) or not question.strip() or len(question) > 5000:
             raise ServiceError("INVALID_INPUT", "A question of at most 5000 characters is required.", 422, False)
-        if isinstance(top_k, bool) or not isinstance(top_k, int) or not 1 <= top_k <= 30 or strategy not in {"similarity", "mmr"}:
+        top_k, strategy = self._retrieval_settings(top_k, strategy)
+        if type(cache) is not bool or type(allow_collection) is not bool:
             raise ServiceError("INVALID_INPUT", "Invalid retrieval settings.", 422, False)
         inputs = self._validate_inputs(applicability)
         initial = {"user_id": user_id, "item_id": item_id, "question": question.strip(),
-            "applicability_inputs": inputs, "top_k": top_k, "strategy": strategy}
+            "applicability_inputs": inputs, "top_k": top_k, "strategy": strategy,
+            "allow_collection": allow_collection, "use_answer_cache": cache}
         start = time.perf_counter()
         try:
             # The graph genuinely invokes the registered retrieve/generate nodes.
