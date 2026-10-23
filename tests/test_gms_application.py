@@ -1,5 +1,7 @@
 """Real application composition with invented private inputs and zero wire I/O."""
 from contextlib import ExitStack, closing
+from copy import deepcopy
+import hashlib
 import io
 import json
 import os
@@ -17,6 +19,8 @@ from warranty.config import Settings
 from warranty.documents import ACTIONS
 from warranty.errors import ServiceError
 from warranty.gms import GMSEmbeddings, GMSStructuredModel
+from warranty.public_gms import GMSPublicStructuredModel
+from warranty.public_protocol import public_instruction_hashes, public_source_sha256
 from warranty.interfaces.api import COOKIE_NAME, create_app
 from warranty.live import LIVE_PURPOSES
 from warranty.prompts import output_schema
@@ -93,8 +97,10 @@ class GMSApplicationTests(unittest.TestCase):
         self.sdk_embedding = self.stack.enter_context(patch("warranty.embeddings._official_sdk_client", side_effect=AssertionError("SDK forbidden")))
         self.fetch = self.stack.enter_context(patch("warranty.security.SafeFetcher.fetch", side_effect=AssertionError("Source HTTP forbidden")))
         self.embed = self.stack.enter_context(patch.object(GMSEmbeddings, "embed", autospec=True, side_effect=GMSEmbeddings.embed))
-        self.generate = self.stack.enter_context(patch.object(GMSStructuredModel, "generate", autospec=True,
-                                                               side_effect=GMSStructuredModel.generate))
+        self.generate = self.stack.enter_context(patch.object(GMSPublicStructuredModel, "generate", autospec=True,
+                                                               side_effect=GMSPublicStructuredModel.generate))
+        self.legacy_generate = self.stack.enter_context(patch.object(GMSStructuredModel, "generate", autospec=True,
+            side_effect=AssertionError("Legacy private GMS wire is forbidden in the product factory")))
 
     def _close_apps(self):
         for app in reversed(self.apps):
@@ -104,7 +110,24 @@ class GMSApplicationTests(unittest.TestCase):
         (self.settings.config_dir / filename).write_text(json.dumps(value), encoding="utf-8")
 
     def build(self, runtime=None, *, policy=False, key="", remote=True, worker=False):
-        self.write("runtime.json", configuration() if runtime is None else runtime)
+        runtime = deepcopy(configuration() if runtime is None else runtime)
+        if "gms" in {runtime.get("models", {}).get(slot) for slot in ("chat_provider", "embedding_provider")}:
+            # Content declarations are not source-rights or execution approval.
+            # This invented, unregistered source is never fetched or generated.
+            public = {"title": "Fictional public factory terms", "url": "https://example.invalid/public-factory",
+                      "excerpt": "This invented factory fixture requires a public transfer confirmation."}
+            bundle = {"schema_version": 1,
+                "item_ids": [Catalog.synthetic().items[0]["item_id"]],
+                "sources": [{"source_id": "SYNTHETIC-factory-source", "version_id": "SYNTHETIC-factory-version", **public}],
+                "embedding_document_sha256s": [hashlib.sha256(public["excerpt"].encode()).hexdigest()],
+                "protocol": {"schema_version": 1, "model": "gpt-4.1-mini", "route": "chat/completions",
+                    "instruction_sha256s": public_instruction_hashes(),
+                    "question_sha256s": [hashlib.sha256(b"Synthetic factory public question").hexdigest()],
+                    "source_sha256s": [public_source_sha256(public)],
+                    "max_request_bytes": 16384, "max_output_tokens": 128}}
+            self.write("public_protocol.synthetic.json", bundle)
+            runtime["models"]["public_protocol_path"] = "public_protocol.synthetic.json"
+        self.write("runtime.json", runtime)
         if policy:
             self.write("source_policy.json", synthetic_policy())
         with patch.dict(os.environ, {"GMS_API_KEY": key}):
@@ -118,7 +141,7 @@ class GMSApplicationTests(unittest.TestCase):
         self.apps.remove(app)
 
     def assert_no_external(self):
-        for spy in (self.wire, self.transport, self.sdk_chat, self.sdk_embedding, self.fetch):
+        for spy in (self.wire, self.transport, self.sdk_chat, self.sdk_embedding, self.fetch, self.legacy_generate):
             spy.assert_not_called()
 
     def assert_no_budget_reservations(self, app):
@@ -154,7 +177,10 @@ class GMSApplicationTests(unittest.TestCase):
     def test_factory_binds_exact_gms_adapters_shared_budgets_and_cache(self):
         app = self.build()
         chat, embedding = app.models.chat.adapter, app.models.embedding
-        self.assertIsInstance(chat, GMSStructuredModel)
+        self.assertIsInstance(chat, GMSPublicStructuredModel)
+        self.assertTrue(chat.public_protocol_only)
+        self.assertEqual(app.models.chat.format_repair_attempts, 0)
+        self.assertTrue(chat.cache_identity.startswith("gms-public-v1:"))
         self.assertIsInstance(embedding, GMSEmbeddings)
         self.assertIs(app.models.chat, app.rag.model)
         self.assertIs(app.rag.runner.model, app.models.chat)
@@ -165,9 +191,15 @@ class GMSApplicationTests(unittest.TestCase):
             self.assertIsNone(adapter._gateway._client)
             self.assertIsNone(adapter._live_scope.get())
         self.assertIs(embedding._embedding_cache, app.models.embedding_cache)
+        self.assertTrue(embedding.public_protocol_only)
+        self.assertEqual(embedding.approved_document_sha256s, app.models.public_context.document_sha256s)
+        self.assertIs(app.rag.vectors.metadata_embeddings, app.models.metadata_embedding)
+        self.assertTrue(app.models.metadata_embedding.is_mock)
         self.assertEqual((chat.model_id, chat.route, chat.max_tokens), ("gpt-4.1-mini", "chat/completions", 128))
         self.assertEqual((embedding.model_id, embedding.dimension), ("text-embedding-3-small", 1536))
-        self.assertEqual(app.rag.metadata_count, 0)
+        # Public mode indexes catalog metadata locally, with its own mock
+        # identity; it consumes no GMS embedding request or credit reservation.
+        self.assertEqual(app.rag.metadata_count, len(app.catalog.items))
         self.embed.assert_not_called()
         self.generate.assert_not_called()
         self.assert_no_budget_reservations(app)

@@ -6,6 +6,7 @@ SDK connection, real document, actual provider price, or real financial action.
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, ExitStack
 from decimal import Decimal
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -32,6 +33,8 @@ from warranty.interfaces.api import create_app
 from warranty.live import live_execution
 from warranty.live_budget import CreditBudget
 from warranty.prompts import output_schema
+from warranty.public_gms import GMSPublicStructuredModel
+from warranty.public_protocol import public_instruction_hashes, public_source_sha256
 from warranty.transactions import verify_accounting
 from warranty.usage import UsageBudget
 
@@ -167,7 +170,15 @@ class GMSLiveBoundaryTests(unittest.TestCase):
         self.assertNotIn(ENV["GMS_API_KEY"], encoded)
         self.assertNotIn(str(self.base), encoded)
 
-    def build(self, *, confirmed=True):
+    def public_transport(self, request):
+        with self.request_lock:
+            self.requests.append(request)
+        result = chat_result()
+        result["model"] = self.reported_model
+        result["choices"][0]["message"]["content"] = json.dumps({"queries": []})
+        return httpx.Response(self.status, json=result)
+
+    def build(self, *, confirmed=True, public_protocol=False):
         runtime = {"models": {"chat_provider": "gms", "chat_model": ENV["GMS_CHAT_MODEL"],
             "embedding_provider": "gms", "embedding_model": ENV["GMS_EMBEDDING_MODEL"],
             "embedding_dimension": 2, "gms_base_url": GMS_BASE_URL,
@@ -177,6 +188,21 @@ class GMSLiveBoundaryTests(unittest.TestCase):
             "usage_limits": {"chat_requests": 10, "embedding_requests": 10, "input_bytes": 1000000}},
             "collection": {"manager_actor": "manager", "worker_enabled": False}}
         catalog = Catalog.synthetic()
+        if public_protocol:
+            question = json.loads(synthetic_prompt())["input"]["question"]
+            source = {"source_id": catalog.items[0]["source_id"], "version_id": "SYNTHETIC-public-version",
+                      "title": "Authored synthetic public boundary", "url": "https://example.invalid/public-boundary",
+                      "excerpt": "This fictional fixture requires written transfer confirmation."}
+            public = {key: source[key] for key in ("title", "url", "excerpt")}
+            sha = lambda text: hashlib.sha256(text.encode("utf-8")).hexdigest()
+            bundle = {"schema_version": 1, "protocol": {"schema_version": 1,
+                "model": ENV["GMS_CHAT_MODEL"], "route": "chat/completions",
+                "instruction_sha256s": public_instruction_hashes(), "question_sha256s": [sha(question)],
+                "source_sha256s": [public_source_sha256(public)], "max_request_bytes": 16384,
+                "max_output_tokens": 64}, "item_ids": [catalog.items[0]["item_id"]],
+                "sources": [source], "embedding_document_sha256s": [sha(source["excerpt"])]}
+            runtime["models"]["public_protocol_path"] = "synthetic_public_bundle.json"
+            (self.settings.config_dir / "synthetic_public_bundle.json").write_text(json.dumps(bundle), encoding="utf-8")
         policy = {"schema_version": 1, "registry": [], "reviews": [],
                   "capabilities": {"manager": ["DATA_MANAGER"]}}
         for source_id, source in catalog.sources.items():
@@ -202,6 +228,10 @@ class GMSLiveBoundaryTests(unittest.TestCase):
         self.stack.enter_context(patch("warranty.gms.GMSEmbeddings",
             side_effect=lambda *args, **kwargs: GMSEmbeddings(*args,
                 transport=httpx.MockTransport(self.transport), **kwargs)))
+        if public_protocol:
+            self.stack.enter_context(patch("warranty.public_gms.GMSPublicStructuredModel",
+                side_effect=lambda *args, **kwargs: GMSPublicStructuredModel(*args,
+                    transport=httpx.MockTransport(self.public_transport), **kwargs)))
         app = build_application(settings=self.settings, start_document_worker=False)
         self.addCleanup(app.close)
         return app
@@ -385,7 +415,7 @@ class GMSLiveBoundaryTests(unittest.TestCase):
         self.assertNotIn(b"SYNTHETIC immutable body", (self.base / "shared-vectors.sqlite3").read_bytes())
 
     def test_factory_exhausted_request_budget_leaves_trade_services_available(self):
-        app = self.build()
+        app = self.build(public_protocol=True)
         adapter = app.models.chat.adapter
         item = app.catalog.items[0]["item_id"]
         for _ in range(10):
@@ -400,13 +430,19 @@ class GMSLiveBoundaryTests(unittest.TestCase):
         self.assertEqual(0, app.models.credit_budget.snapshot()["request_count"])
 
     def test_unapproved_reported_model_persists_credit_freeze_without_disabling_trades(self):
-        app = self.build()
+        app = self.build(public_protocol=True)
         self.reported_model = "SYNTHETIC-unapproved-model"
         item = app.catalog.items[0]["item_id"]
         with live_execution(app, "verification", APPROVAL), app.models.chat.processing_context("buyer", item):
             self.assert_code("LIVE_MODEL_IDENTITY_MISMATCH",
                              lambda: app.models.chat.generate("query", synthetic_prompt()))
         self.assertEqual(1, len(self.requests))
+        wire = json.loads(self.requests[0].content)
+        self.assertEqual({"question": "SYNTHETIC offline query", "sources": []},
+                         json.loads(wire["messages"][1]["content"]))
+        self.assertIs(wire["store"], False)
+        self.assertIs(wire["stream"], False)
+        self.assertNotIn("output_schema", wire["messages"][0]["content"])
         snapshot = app.models.credit_budget.snapshot()
         self.assertFalse(snapshot["ready"])
         self.assertEqual("LIVE_BUDGET_UNAVAILABLE", snapshot["reason_code"])

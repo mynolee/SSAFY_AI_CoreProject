@@ -70,6 +70,7 @@ def load_runtime(settings):
         "embedding_dimension": None, "external_processing_approved": False,
         "allow_question_processing": False, "gms_base_url": None, "gms_chat_route": None,
         "gms_max_output_tokens": None,
+        "public_protocol_path": None,
         "usage_approval_id": None,
         "usage_limits": {"chat_requests": 0, "embedding_requests": 0, "input_bytes": 0}})
     collection = _section(value.get("collection", {}), {
@@ -85,6 +86,7 @@ def load_runtime(settings):
         _text(models[field], optional=True)
     _text(models["gms_base_url"], optional=True, limit=200)
     _text(models["gms_chat_route"], optional=True, limit=50)
+    _text(models["public_protocol_path"], optional=True, limit=4096)
     if models["gms_base_url"] not in {None, "https://gms.ssafy.io/gmsapi/api.openai.com/v1", "https://gms.ssafy.io/gmsapi/api.openai.com/v1/"}:
         _invalid()
     if models["gms_chat_route"] not in {None, "responses", "chat/completions"}:
@@ -312,6 +314,9 @@ class AuthorizedChatModel:
     def __init__(self, adapter, authorization):
         self.adapter, self.authorization = adapter, authorization
         self.model_id = adapter.model_id
+        self.format_repair_attempts = getattr(adapter, "format_repair_attempts", 1)
+        self.public_protocol_only = getattr(adapter, "public_protocol_only", False)
+        self.cache_identity = getattr(adapter, "cache_identity", self.model_id)
 
     def processing_context(self, actor, item_id):
         return self.authorization.scope(actor, item_id)
@@ -328,11 +333,18 @@ class AuthorizedChatModel:
             close()
 
 
-def build_models(settings, runtime, authorization):
+def build_models(settings, runtime, authorization, *, env=None):
     from .prompts import MockStructuredModel, OpenAIStructuredModel
     from .vectorstore import MockEmbeddings
     values = runtime["models"]
-    environment = {key: os.environ.get(key, "") for key in
+    supplied_env = os.environ if env is None else env
+    from .public_runtime import load_public_bundle, PublicProcessingContext, PublicProtocolRequired
+    public_bundle = load_public_bundle(settings, values.get("public_protocol_path"))
+    public_context = PublicProcessingContext(public_bundle, authorization) if public_bundle else None
+    if public_context:
+        for item_id in public_context.item_ids:
+            authorization.catalog.get(item_id)
+    environment = {key: supplied_env.get(key, "") for key in
                    ("OPENAI_API_KEY", "CHAT_MODEL", "CHAT_MODEL_VERSION", "EMBEDDING_MODEL", "EMBEDDING_MODEL_VERSION", "EMBEDDING_DIMENSION")}
     for option, variable in (("chat_model", "CHAT_MODEL"), ("chat_model_version", "CHAT_MODEL_VERSION"),
                              ("embedding_model", "EMBEDDING_MODEL"), ("embedding_model_version", "EMBEDDING_MODEL_VERSION"),
@@ -342,7 +354,8 @@ def build_models(settings, runtime, authorization):
     chat = MockStructuredModel()
     budget = credit_budget = embedding_cache = None
     if values["chat_provider"] == "openai":
-        chat = AuthorizedChatModel(OpenAIStructuredModel(settings, authorization.model_guard, env=environment), authorization)
+        # Product private PromptStore policies have no outbound authorization.
+        chat = AuthorizedChatModel(PublicProtocolRequired("openai"), authorization)
     embedding = MockEmbeddings()
     if values["embedding_provider"] == "openai":
         from .embeddings import OpenAIEmbeddings
@@ -352,13 +365,13 @@ def build_models(settings, runtime, authorization):
                 raise ValueError()
         except (TypeError, ValueError):
             _invalid()
-        embedding = OpenAIEmbeddings(settings, authorization.embedding_guard, env=environment)
+        embedding = PublicProtocolRequired("openai", dimension=dimension)
     if "gms" in {values["chat_provider"], values["embedding_provider"]}:
         from .gms import GMSStructuredModel, GMSEmbeddings
         from .usage import UsageBudget
         from .live_budget import CreditBudget
         from .embedding_cache import EmbeddingCache
-        gms_environment = {key: os.environ.get(key, "") for key in ("GMS_API_KEY", "GMS_BASE_URL",
+        gms_environment = {key: supplied_env.get(key, "") for key in ("GMS_API_KEY", "GMS_BASE_URL",
             "GMS_CHAT_MODEL", "GMS_CHAT_MODEL_VERSION", "GMS_CHAT_ROUTE", "GMS_EMBEDDING_MODEL",
             "GMS_EMBEDDING_MODEL_VERSION", "GMS_EMBEDDING_DIMENSION", "GMS_MAX_OUTPUT_TOKENS")}
         for option, variable in (("chat_model", "GMS_CHAT_MODEL"), ("chat_model_version", "GMS_CHAT_MODEL_VERSION"),
@@ -368,22 +381,44 @@ def build_models(settings, runtime, authorization):
             if values[option] is not None:
                 gms_environment[variable] = str(values[option])
         identity = {key: value for key, value in gms_environment.items() if key != "GMS_API_KEY"}
+        if public_bundle:
+            identity["public_bundle_sha256"] = public_bundle.fingerprint
         fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()
         budget = UsageBudget(settings.data_dir / "model_usage.sqlite3", values["usage_approval_id"] or "",
                              values["usage_limits"], context_fingerprint=fingerprint)
         profile = read_private_json(settings.config_dir / "live_budget.json", default=None)
         credit_budget = CreditBudget(settings.data_dir / "model_credits.sqlite3", values["usage_approval_id"] or "",
                                      profile, context_fingerprint=fingerprint)
-        embedding_cache = EmbeddingCache(settings.data_dir / "embedding_cache.sqlite3")
+        embedding_cache = (EmbeddingCache(settings.data_dir / "embedding_cache.sqlite3")
+                           if public_context else None)
         if values["chat_provider"] == "gms":
-            chat = AuthorizedChatModel(GMSStructuredModel(settings, authorization.model_guard,
-                env=gms_environment, usage_budget=budget, credit_budget=credit_budget), authorization)
+            if public_context:
+                from .public_gms import GMSPublicStructuredModel
+                adapter = GMSPublicStructuredModel(settings, public_context.model_guard,
+                    public_manifest=public_bundle.protocol, public_source_resolver=public_context.source_resolver,
+                    env=gms_environment, usage_budget=budget, credit_budget=credit_budget)
+            else:
+                adapter = PublicProtocolRequired("gms")
+            chat = AuthorizedChatModel(adapter, authorization)
         if values["embedding_provider"] == "gms":
-            embedding = GMSEmbeddings(settings, authorization.embedding_guard,
-                env=gms_environment, usage_budget=budget, credit_budget=credit_budget,
-                embedding_cache=embedding_cache)
+            if public_context:
+                embedding = GMSEmbeddings(settings, public_context.embedding_guard,
+                    env=gms_environment, usage_budget=budget, credit_budget=credit_budget,
+                    embedding_cache=embedding_cache)
+                embedding.public_protocol_only = True
+                embedding.approved_document_sha256s = public_context.document_sha256s
+            else:
+                embedding = PublicProtocolRequired("gms", dimension=values["embedding_dimension"])
+    if public_context and getattr(embedding, "is_mock", False):
+        # Local rehearsal uses the same selected document scope as the public
+        # adapter, while catalog metadata remains on a separate local adapter.
+        embedding.public_protocol_only = True
+        embedding.approved_document_sha256s = public_context.document_sha256s
     return SimpleNamespace(chat=chat, embedding=embedding, usage_budget=budget,
-                           credit_budget=credit_budget, embedding_cache=embedding_cache)
+                           credit_budget=credit_budget, embedding_cache=embedding_cache,
+                           public_context=public_context,
+                           metadata_embedding=MockEmbeddings() if public_context else None,
+                           document_item_ids=list(public_context.item_ids) if public_context else None)
 
 
 def load_document_plan(settings):

@@ -15,7 +15,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="warranty")
     parser.add_argument("command", choices=("status", "streamlit", "api", "worker", "validate-input",
         "documents-sync", "documents-import", "index-metadata", "prepare-documents", "document-worker", "job", "evaluate",
-        "live-index-metadata", "live-prepare-documents", "live-query"))
+        "live-index-metadata", "live-prepare-documents", "live-query", "public-protocol"))
     parser.add_argument("--metadata", type=Path)
     parser.add_argument("--sha256")
     parser.add_argument("--port", type=int)
@@ -72,6 +72,11 @@ def main(argv=None):
                 actor = args.actor or (getattr(app, "runtime", None) or {}).get("collection", {}).get("manager_actor")
                 if args.command == "status":
                     result = app.summary()
+                elif args.command == "public-protocol":
+                    context = getattr(app.models, "public_context", None)
+                    result = (context.summary() if context else {
+                        "configured": False, "creates_transmission_authority": False,
+                        "reason_code": "PUBLIC_PROTOCOL_REQUIRED"})
                 elif args.command == "worker":
                     result = app.worker.run_pending()
                 elif args.command in {"documents-sync", "documents-import", "index-metadata"}:

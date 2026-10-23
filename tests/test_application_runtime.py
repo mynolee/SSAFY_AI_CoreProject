@@ -220,8 +220,16 @@ class ApplicationRuntimeTests(unittest.TestCase):
             app = self.build(runtime, policy=True, remote=True)
         status = self.assert_public_status(app)
         for name in ("chat", "embedding"):
-            self.assertTrue(status[name]["configured"])
+            # A supplied key cannot configure the factory's blocked private
+            # protocol placeholder or authorize a legacy outbound envelope.
+            self.assertFalse(status[name]["configured"])
             self.assertFalse(status[name]["ready"])
+        for adapter in (app.models.chat.adapter, app.models.embedding):
+            metadata = adapter.metadata()
+            self.assertTrue(metadata["public_protocol_required"])
+            self.assertFalse(metadata["configuration_ready"])
+            self.assertFalse(metadata["can_generate"])
+            self.assertEqual(metadata["reason_code"], "PUBLIC_PROTOCOL_REQUIRED")
         self.assertFalse(status["external_processing_approved"])
         self.assertFalse(status["question_processing_approved"])
         self.assertNotIn("SYNTHETIC-NOT-A-REAL-CREDENTIAL", json.dumps(status))

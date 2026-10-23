@@ -55,7 +55,9 @@ class Application:
                 "registered_target_count": len(registry.registered_candidates())},
             "external_processing_approved": config.get("external_processing_approved", False),
             "question_processing_approved": config.get("allow_question_processing", False),
-            "document_worker_enabled": collection.get("worker_enabled", False), "live": self.live_status()}
+            "document_worker_enabled": collection.get("worker_enabled", False), "live": self.live_status(),
+            "public_processing": (self.models.public_context.summary()
+                if getattr(self.models, "public_context", None) else {"configured": False, "creates_transmission_authority": False})}
 
     def live_status(self):
         from .live import live_status
@@ -76,7 +78,7 @@ def _runtime(settings):
     return load_runtime(settings)
 
 
-def build_application(settings: Settings | None = None, metadata_path=None, *, start_document_worker=True) -> Application:
+def build_application(settings: Settings | None = None, metadata_path=None, *, start_document_worker=True, env=None) -> Application:
     """Load configured facts, use synthetic facts only when no input was configured."""
     os.environ["ANONYMIZED_TELEMETRY"] = "false"
     os.environ["LANGSMITH_TRACING"] = "false"
@@ -100,8 +102,9 @@ def build_application(settings: Settings | None = None, metadata_path=None, *, s
         not isinstance(metadata_path, (str, Path)) or not str(metadata_path).strip()
     ):
         raise ServiceError("CONFIG_INVALID", "입력 파일 설정을 확인해 주세요.", 503)
-    source = metadata_path if metadata_path is not None else os.environ.get("METADATA_PATH") or runtime.get("metadata_path")
-    expected_hash = os.environ.get("METADATA_EXPECTED_HASH") or runtime.get("metadata_expected_hash")
+    supplied_env = os.environ if env is None else env
+    source = metadata_path if metadata_path is not None else supplied_env.get("METADATA_PATH") or runtime.get("metadata_path")
+    expected_hash = supplied_env.get("METADATA_EXPECTED_HASH") or runtime.get("metadata_expected_hash")
     catalog = Catalog.load(source, expected_hash=expected_hash) if source is not None else Catalog.synthetic()
     try:
         policy = load_source_policy(settings, runtime)
@@ -109,7 +112,7 @@ def build_application(settings: Settings | None = None, metadata_path=None, *, s
     except (ValueError, TypeError, KeyError):
         raise ServiceError("CONFIG_INVALID", "비공개 실행 설정을 확인해 주세요.", 503, False) from None
     authorization = ProcessingAuthorization(settings, runtime, catalog, policy)
-    models = build_models(settings, runtime, authorization)
+    models = build_models(settings, runtime, authorization, **({"env": env} if env is not None else {}))
     db = Database(settings.data_dir / "warranty.sqlite3")
     db.initialize()
     with db.transaction() as conn:
@@ -122,6 +125,8 @@ def build_application(settings: Settings | None = None, metadata_path=None, *, s
     collection, retrieval = runtime["collection"], runtime["retrieval"]
     try:
         rag = RagService(catalog, db, settings, model=models.chat, embeddings=models.embedding,
+            metadata_embeddings=getattr(models, "metadata_embedding", None),
+            document_item_ids=getattr(models, "document_item_ids", None),
             source_policy=policy, fetcher=SafeFetcher(policy) if collection["network_enabled"] else None,
             index_actor=collection["manager_actor"], chunk_size=retrieval["chunk_size"],
             chunk_overlap=retrieval["chunk_overlap"], default_top_k=retrieval["top_k"],
