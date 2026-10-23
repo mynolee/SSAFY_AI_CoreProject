@@ -54,7 +54,8 @@ class RagService:
     def __init__(self, catalog, db, settings, *, model=None, prompt_store=None,
                  source_policy=None, fetcher=None, embeddings=None, chunk_size=1000,
                  chunk_overlap=200, index_actor=None, collector=None, document_jobs=None,
-                 default_top_k=6, default_strategy="similarity", mmr_fetch_k=30, mmr_lambda_mult=0.5):
+                 default_top_k=6, default_strategy="similarity", mmr_fetch_k=30, mmr_lambda_mult=0.5,
+                 metadata_embeddings=None, document_item_ids=None):
         self.catalog, self.db, self.settings = catalog, db, settings
         self.model = model or MockStructuredModel()
         self.prompt_store = prompt_store or PromptStore(settings.config_dir)
@@ -78,16 +79,29 @@ class RagService:
             clean = {key: value for key, value in item.items() if key != "readiness"}
             self._metadata_records.append({"item_id": str(item["item_id"]), "text": item.get("index_text", canonical_json(clean))})
         self.dataset_hash = getattr(catalog, "dataset_hash", digest(self._metadata_records))
+        self.document_item_ids = (None if document_item_ids is None else
+            tuple(record["item_id"] for record in self._metadata_selection(document_item_ids)))
         if embeddings is not None:
             if not isinstance(getattr(embeddings, "is_remote", None), bool):
                 raise ServiceError("MODEL_REMOTE_BLOCKED", "The embedding adapter must declare its processing location.", 503, False)
-        self.vectors = LocalVectorStore(Path(settings.data_dir) / "chroma", embeddings)
+        if metadata_embeddings is not None and not isinstance(getattr(metadata_embeddings, "is_remote", None), bool):
+            raise ServiceError("MODEL_REMOTE_BLOCKED", "The metadata adapter must declare its processing location.", 503, False)
+        self.vectors = LocalVectorStore(Path(settings.data_dir) / "chroma", embeddings,
+            metadata_embeddings=metadata_embeddings)
+        self._public_metadata_scope = (metadata_embeddings is not None and self.document_item_ids is not None
+            and self.vectors.metadata_embeddings.is_remote is False)
+        self._approved_document_sha256s = None
+        if self._public_protocol(self.vectors.embeddings):
+            self._approved_document_sha256s = self._public_document_hashes()
+            self.chunk_config_hash = digest({"size": chunk_size, "overlap": chunk_overlap,
+                "document_item_ids": sorted(self.document_item_ids),
+                "approved_document_sha256s": sorted(self._approved_document_sha256s)})
         self._lock = threading.RLock()
         with self.db.transaction() as connection:
             for item in catalog.items:
                 connection.execute("INSERT OR IGNORE INTO items(item_id,name,provider) VALUES(?,?,?)",
                     (item["item_id"], item.get("name", item["item_id"]), item.get("provider", "UNKNOWN")))
-        if self.vectors.embeddings.is_remote:
+        if self.vectors.metadata_embeddings.is_remote:
             self._metadata_state()
         else:
             self.vectors.index_metadata(self._metadata_records, dataset_hash=self.dataset_hash)
@@ -117,7 +131,7 @@ class RagService:
     def prepare_metadata(self, actor, item_ids=None):
         """Prepare only explicitly chosen remote metadata; app startup is read-only."""
         self.registry.policy.require_capability(actor, "DATA_MANAGER")
-        remote = self.vectors.embeddings.is_remote
+        remote = self.vectors.metadata_embeddings.is_remote
         if remote and (not self.settings.remote_models or item_ids is None):
             raise ServiceError("MODEL_REMOTE_BLOCKED", "Remote metadata preparation requires enabled models and explicit item identities.", 503, False)
         selected = self._metadata_selection(item_ids)
@@ -135,27 +149,46 @@ class RagService:
             if pending:
                 pending_sources = sorted({self.catalog.get(record["item_id"]).get("source_id", "") for record in pending})
                 with self._embedding_context([{"kind": "metadata", "source_id": source,
-                        "version_id": self.dataset_hash, "actor": actor} for source in pending_sources]):
+                        "version_id": self.dataset_hash, "actor": actor} for source in pending_sources], metadata=True):
                     self.vectors.index_metadata(pending, dataset_hash=self.dataset_hash,
                         replace=not remote and item_ids is None)
             state = self._metadata_state([record["item_id"] for record in selected] if item_ids is not None else None)
         return {"status": "META_READY", **state, "selected_metadata_count": len(selected),
             "item_ids": [record["item_id"] for record in selected], "dataset_hash": self.dataset_hash,
-            "embedding_model": self.vectors.embeddings.name}
+            "embedding_model": self.vectors.metadata_embeddings.name}
 
     def _run_model(self, kind, variables, actor, item_id):
         contextualize = getattr(self.model, "processing_context", None)
         with contextualize(actor, item_id) if callable(contextualize) else nullcontext():
             return self.runner.run(kind, variables)
 
-    def _embedding_context(self, contexts):
-        embeddings = self.vectors.embeddings
+    def _embedding_context(self, contexts, *, metadata=False):
+        embeddings = self.vectors.metadata_embeddings if metadata else self.vectors.embeddings
         contextualize = getattr(embeddings, "processing_context", None)
         if callable(contextualize):
             return contextualize(contexts)
         if embeddings.is_remote and not getattr(embeddings, "is_mock", False):
             raise ServiceError("MODEL_REMOTE_BLOCKED", "Remote embedding processing context is unavailable.", 503, False)
         return nullcontext()
+
+    def _public_protocol(self, adapter):
+        return self._public_metadata_scope and getattr(adapter, "public_protocol_only", False) is True
+
+    def _public_document_hashes(self):
+        values = getattr(self.vectors.embeddings, "approved_document_sha256s", None)
+        if (not isinstance(values, tuple) or any(not isinstance(value, str) or
+                re.fullmatch(r"[a-f0-9]{64}", value) is None for value in values)
+                or len(values) != len(set(values))):
+            raise ServiceError("MODEL_REMOTE_BLOCKED", "An exact public document chunk scope is required.", 503, False)
+        return values
+
+    def _require_selected_item(self, item_id):
+        if self.document_item_ids is not None and item_id not in self.document_item_ids:
+            raise ServiceError("SOURCE_BLOCKED", "The item is outside the selected document scope.", 403, False)
+
+    def _require_catalog_processing(self, item_id, actor, adapter):
+        self.registry._require(self.catalog.get(item_id).get("source_id", ""),
+            "local_embed" if self._public_protocol(adapter) else "external_process", actor, self.dataset_hash)
 
     def _query_context(self, item_id, actor):
         return [{"kind": "question", "source_id": self.catalog.get(item_id).get("source_id", ""),
@@ -187,7 +220,12 @@ class RagService:
             "official_document_version_count": len(official), "synthetic_document_body_count": len({row["body_hash"] for row in synthetic}),
             "official_document_chunk_count": sum(row["source_type"] == "official_document" for row in chunks),
             "synthetic_document_chunk_count": sum(row["source_type"] == "synthetic_document" for row in chunks),
-            "embedding_model": self.vectors.embeddings.name, "embedding_dimension": self.vectors.embeddings.dimension}
+            "embedding_model": self.vectors.embeddings.name, "embedding_dimension": self.vectors.embeddings.dimension,
+            "metadata_embedding_model": self.vectors.metadata_embeddings.name,
+            "document_scope": {"mode": "approved_chunk_hashes" if self._approved_document_sha256s is not None else "registered_bodies",
+                "item_ids": list(self.document_item_ids) if self.document_item_ids is not None else None,
+                "approved_chunk_hash_count": len(self._approved_document_sha256s) if self._approved_document_sha256s is not None else None,
+                "entire_registered_bodies_indexed": self._approved_document_sha256s is None}}
 
     def _build_graph(self):
         try:
@@ -301,6 +339,10 @@ class RagService:
             revision = None
             index_started = None
             try:
+                self._require_selected_item(item_id)
+                if (self._approved_document_sha256s is not None and
+                        self._public_document_hashes() != self._approved_document_sha256s):
+                    raise ServiceError("SOURCE_BLOCKED", "The approved public document chunk scope changed.", 409, False)
                 if collect and self.collector is not None:
                     collection_started = time.perf_counter()
                     try:
@@ -324,7 +366,9 @@ class RagService:
                 if self.vectors.embeddings.is_remote and item_id not in prepared_metadata:
                     raise ServiceError("INDEX_EMPTY", "Prepare this item's metadata before document embeddings.", 409, False)
                 candidates = self.registry.candidates()
-                if self.vectors.embeddings.is_remote:
+                if self.document_item_ids is not None:
+                    candidates = [candidate for candidate in candidates if candidate["item_id"] in self.document_item_ids]
+                elif self.vectors.embeddings.is_remote:
                     candidates = [candidate for candidate in candidates if candidate["item_id"] in prepared_metadata]
                 chunks = []
                 versions = []
@@ -336,22 +380,28 @@ class RagService:
                         self.registry._require(candidate["source_id"], "display_excerpt", actor, candidate["version_id"])
                         if self.vectors.embeddings.is_remote:
                             self.registry._require(candidate["source_id"], "external_process", actor, candidate["version_id"])
-                            self.registry._require(self.catalog.get(candidate["item_id"]).get("source_id", ""), "external_process", actor, self.dataset_hash)
+                            self._require_catalog_processing(candidate["item_id"], actor, self.vectors.embeddings)
                     except ServiceError:
                         if candidate["item_id"] == item_id and candidate["own_document"]:
                             raise
                         continue
-                    versions.append(candidate["version_id"])
                     is_synthetic = json.loads(candidate["review_json"]).get("is_synthetic", False)
+                    candidate_chunks = []
                     for ordinal, chunk in enumerate(chunk_sections(sections, self.chunk_size, self.chunk_overlap)):
+                        if (self._approved_document_sha256s is not None and
+                                digest(chunk["text"].encode("utf-8")) not in self._approved_document_sha256s):
+                            continue
                         evidence_id = "doc-" + digest([candidate["item_id"], candidate["version_id"], self.chunk_config_hash, candidate["role"], ordinal])
-                        chunks.append({**chunk, "evidence_id": evidence_id,
+                        candidate_chunks.append({**chunk, "evidence_id": evidence_id,
                             "item_id": candidate["item_id"], "version_id": candidate["version_id"],
                             "document_version_id": candidate["version_id"], "document_id": candidate["document_id"],
                             "source_id": candidate["source_id"], "title": candidate["title"],
                             "url": candidate["canonical_url"], "source_url": candidate["canonical_url"],
                             "type": candidate["document_type"], "role": candidate["role"],
                             "source_type": "synthetic_document" if is_synthetic else "official_document"})
+                    if candidate_chunks:
+                        versions.append(candidate["version_id"])
+                        chunks.extend(candidate_chunks)
                 if not chunks or not any(chunk["item_id"] == item_id and chunk["role"] in OWN_ROLES for chunk in chunks):
                     raise ServiceError("OWN_DOCUMENT_MISSING", "The item's own document could not be indexed.", 409, False)
                 revision = digest([self.dataset_hash, sorted(set(versions)),
@@ -367,11 +417,11 @@ class RagService:
                             "version_id": version, "actor": actor}
                             for source, version in sorted({(chunk["source_id"], chunk["version_id"]) for chunk in chunks})]):
                         self.vectors.stage_documents(revision, chunks)
-                    # Verify item filters before exposing a new revision.
-                    for linked_item in set(chunk["item_id"] for chunk in chunks):
-                        with self._embedding_context(self._query_context(linked_item, actor)):
-                            found = self.vectors.search(linked_item, revision, linked_item, 1)
-                        if not found:
+                    # Validate exact local corpus filters without embedding
+                    # an internal catalog identity as a remote query.
+                    for linked_item, version, role in {
+                            (chunk["item_id"], chunk["version_id"], chunk["role"]) for chunk in chunks}:
+                        if not self.vectors.has_document(linked_item, revision, version, role):
                             raise ServiceError("INDEX_EMPTY", "Retrieval validation of the prepared revision failed.", 503, True)
                     self.registry.policy.require_capability(actor, "DATA_MANAGER")
                     with self.db.transaction() as connection:
@@ -427,10 +477,11 @@ class RagService:
         """
         emit = progress or (lambda stage, **counts: None)
         item = self.catalog.get(item_id)
+        self._require_selected_item(item_id)
         if not getattr(self.model, "is_mock", False):
             if not self.settings.remote_models:
                 raise ServiceError("KEY_MISSING", "Remote model processing is disabled.", 503, False)
-            self.registry._require(item.get("source_id", ""), "external_process", user_id, self.dataset_hash)
+            self._require_catalog_processing(item_id, user_id, self.model)
         emit("QUERYING")
         query = self._run_model("query", {"item": item, "question": question, "applicability": inputs}, user_id, item_id)
         existing = self.registry.candidates(item_id)
@@ -556,7 +607,7 @@ class RagService:
                 raise ServiceError("MODEL_REMOTE_BLOCKED", "Remote embeddings are disabled.", 503, False)
             if not self.vectors.metadata_matches(self._metadata_selection([state["item_id"]]), self.dataset_hash, exact=False):
                 raise ServiceError("INDEX_EMPTY", "The selected item's metadata index is not ready.", 409, False)
-            self.registry._require(item.get("source_id", ""), "external_process", state["user_id"], self.dataset_hash)
+            self._require_catalog_processing(state["item_id"], state["user_id"], self.vectors.embeddings)
             for candidate in usable:
                 self.registry._require(candidate["source_id"], "external_process", state["user_id"], candidate["version_id"])
         ranking_start = time.perf_counter()
@@ -632,7 +683,7 @@ class RagService:
             "missing_information": state["missing_information"], "conflicts": state["conflicts"]}
         cache_key = digest([self.dataset_hash, state["user_id"], state["item_id"], state["applicability_inputs"],
             normalize(state["question"]).casefold(), state["revision"], self.vectors.embeddings.name,
-            self.chunk_config_hash, getattr(self.model, "model_id", type(self.model).__name__),
+            self.chunk_config_hash, getattr(self.model, "cache_identity", getattr(self.model, "model_id", type(self.model).__name__)),
             self.prompt_store.load("answer"), variables["evidence"], state["missing_information"], state["conflicts"]])
         use_cache = state.get("use_answer_cache", True)
         cached = self._cache_get("answer", cache_key) if use_cache else None
@@ -734,7 +785,7 @@ class RagService:
         ranking_start = time.perf_counter()
         if revision:
             if self.vectors.embeddings.is_remote:
-                self.registry._require(self.catalog.get(item_id).get("source_id", ""), "external_process", user_id, self.dataset_hash)
+                self._require_catalog_processing(item_id, user_id, self.vectors.embeddings)
             with self._embedding_context(self._query_context(item_id, user_id)):
                 ranked = self.vectors.search(item_id, revision, question, top_k, "mmr", fetch_k=self.mmr_fetch_k,
                     lambda_mult=self.mmr_lambda_mult, allowed_pairs=pairs)

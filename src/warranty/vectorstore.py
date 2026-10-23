@@ -45,23 +45,27 @@ class LocalVectorStore:
     the last good revision. Only validated revisions become active in SQLite.
     """
 
-    def __init__(self, path: Path, embeddings=None):
+    def __init__(self, path: Path, embeddings=None, *, metadata_embeddings=None):
         try:
             import chromadb
             from chromadb.config import Settings as ChromaSettings
         except ImportError as exc:
             raise ServiceError("INDEX_EMPTY", "Local Chroma dependency is unavailable.", 503, False) from exc
         self.embeddings = embeddings or MockEmbeddings()
+        # The public runtime supplies an explicit local adapter. Omitting it
+        # retains the legacy collection/model identity and preparation flow.
+        self.metadata_embeddings = metadata_embeddings or self.embeddings
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
         self.client = chromadb.PersistentClient(
             path=str(self.path), settings=ChromaSettings(anonymized_telemetry=False)
         )
-        suffix = "" if (self.embeddings.name == MockEmbeddings.name and self.embeddings.dimension == 64) else (
-            "_" + hashlib.sha256(self.embeddings.name.encode()).hexdigest()[:12] + "_" + str(self.embeddings.dimension))
-        self.meta = self.client.get_or_create_collection("warranty_meta" + suffix,
-            metadata={"hnsw:space": "cosine", "embedding_model": self.embeddings.name}, embedding_function=None)
-        self.docs = self.client.get_or_create_collection("warranty_docs" + suffix,
+        def suffix(adapter):
+            return "" if (adapter.name == MockEmbeddings.name and adapter.dimension == 64) else (
+                "_" + hashlib.sha256(adapter.name.encode()).hexdigest()[:12] + "_" + str(adapter.dimension))
+        self.meta = self.client.get_or_create_collection("warranty_meta" + suffix(self.metadata_embeddings),
+            metadata={"hnsw:space": "cosine", "embedding_model": self.metadata_embeddings.name}, embedding_function=None)
+        self.docs = self.client.get_or_create_collection("warranty_docs" + suffix(self.embeddings),
             metadata={"hnsw:space": "cosine", "embedding_model": self.embeddings.name}, embedding_function=None)
 
     @staticmethod
@@ -115,7 +119,7 @@ class LocalVectorStore:
             raise ServiceError("INVALID_INPUT", "Invalid metadata indexing settings.", 422, False)
         if records:
             texts = [record["text"] for record in records]
-            self.meta.upsert(ids=ids, documents=texts, embeddings=self.embeddings.embed(texts),
+            self.meta.upsert(ids=ids, documents=texts, embeddings=self.metadata_embeddings.embed(texts),
                 metadatas=[{"item_id": value, "source_type": "metadata",
                             **({"dataset_hash": dataset_hash} if dataset_hash is not None else {})}
                            for value in ids])
