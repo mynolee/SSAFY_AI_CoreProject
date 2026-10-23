@@ -254,6 +254,39 @@ class RagService:
             return None
         return manifest
 
+    def _own_documents_ready(self, candidates, manifest, actor):
+        """Every required own link must remain usable in the active corpus."""
+        own = [candidate for candidate in candidates if candidate["own_document"]]
+        if not own or not manifest:
+            return False
+        if any(candidate["own_document"] and not candidate["version_id"]
+               for candidate in self.registry.registered_candidates(own[0]["item_id"])):
+            return False
+        versions = set(json.loads(manifest["version_ids_json"]))
+        for candidate in own:
+            if (candidate["version_id"] not in versions or not self.vectors.has_document(
+                    candidate["item_id"], manifest["revision"], candidate["version_id"], candidate["role"])):
+                return False
+            try:
+                self.registry._require(candidate["source_id"], "local_embed", actor, candidate["version_id"])
+                self.registry._require(candidate["source_id"], "display_excerpt", actor, candidate["version_id"])
+            except ServiceError:
+                return False
+        return True
+
+    @staticmethod
+    def _version_conflicts(candidates, inputs):
+        """Do not let a model choose between overlapping contract versions."""
+        versions = {}
+        for candidate in candidates:
+            missing, conflicts = applicability_issues(inputs, json.loads(candidate["applicability_json"]))
+            if missing or conflicts:
+                continue
+            key = (candidate["document_id"], candidate["role"])
+            versions.setdefault(key, set()).add(candidate["body_hash"])
+        return ["Multiple linked document versions match the same contract: " + role + "."
+                for (_, role), hashes in sorted(versions.items()) if len(hashes) > 1]
+
     def _cache_get(self, kind, key):
         with closing(self.db.connect()) as connection:
             row = connection.execute("SELECT * FROM rag_cache WHERE cache_kind=? AND cache_key=?", (kind, key)).fetchone()
@@ -294,9 +327,12 @@ class RagService:
             raise ServiceError("INVALID_INPUT", "Invalid document job request.", 422, False)
         if request.get("dataset_hash", self.dataset_hash) != self.dataset_hash:
             return {"status": "BLOCKED", "stage": "DOC_BLOCKED", "failure_code": "DATASET_CHANGED"}
+        attempt = request.get("attempt_no", 1)
+        if type(attempt) is not int or not 1 <= attempt <= 10:
+            raise ServiceError("INVALID_INPUT", "Invalid document job attempt.", 422, False)
         return self._prepare(request["requester"], request["item_id"],
             self._validate_inputs(request.get("applicability")), self._preparation_question(request.get("question")),
-            job_id=request["job_id"], progress=progress)
+            job_id=request["job_id"], progress=progress, retry_failed=attempt > 1)
 
     @staticmethod
     def _preparation_question(question):
@@ -310,7 +346,7 @@ class RagService:
         """Synchronous compatibility entry point; UIs enqueue persistent jobs."""
         return self._prepare(user_id, item_id, self._validate_inputs(applicability), self._preparation_question(question))
 
-    def _prepare(self, user_id, item_id, inputs, question, *, job_id=None, progress=None, collect=True):
+    def _prepare(self, user_id, item_id, inputs, question, *, job_id=None, progress=None, collect=True, retry_failed=False):
         """Request and execute a bounded local indexing job.
 
         The local worker only reads already registered/reviewed bodies. External
@@ -347,7 +383,7 @@ class RagService:
                     collection_started = time.perf_counter()
                     try:
                         prepared = self._source_pipeline(user_id, item_id, question, inputs,
-                            progress=lambda stage, **counts: update(stage=stage, **counts))
+                            progress=lambda stage, **counts: update(stage=stage, **counts), retry_failed=retry_failed)
                     finally:
                         outcome["collection_elapsed_seconds"] = time.perf_counter() - collection_started
                     if prepared["collection_status"] in {"FAILED", "BLOCKED"}:
@@ -356,7 +392,9 @@ class RagService:
                 index_started = time.perf_counter()
                 own = self.registry.candidates(item_id)
                 update(stage="CHECKING_DOCUMENTS", candidate_count=len(own))
-                if not any(candidate["own_document"] for candidate in own):
+                if (not any(candidate["own_document"] for candidate in own) or
+                        any(candidate["own_document"] and not candidate["version_id"]
+                            for candidate in self.registry.registered_candidates(item_id))):
                     raise ServiceError("OWN_DOCUMENT_MISSING", "No approved document belonging to this item is available.", 409, False)
                 actor = self.index_actor or user_id
                 self.registry.policy.require_capability(actor, "DATA_MANAGER")
@@ -468,7 +506,7 @@ class RagService:
             self.registry.policy.require_capability(user_id, "DATA_MANAGER")
         return dict(row)
 
-    def _source_pipeline(self, user_id, item_id, question, inputs, *, progress=None, allow_collection=True):
+    def _source_pipeline(self, user_id, item_id, question, inputs, *, progress=None, allow_collection=True, retry_failed=False):
         """Query -> discover -> select -> fetch, all inside the retrieve service.
 
         Discovery yields registered targets, including own documents with no
@@ -488,7 +526,8 @@ class RagService:
         discovered = []
         if self.collector is not None and allow_collection:
             emit("DISCOVERING")
-            discovered = self.collector.discover(item_id, question, query["queries"], inputs, user_id)
+            discovered = self.collector.discover(item_id, question, query["queries"], inputs, user_id,
+                                                refresh=retry_failed)
             if not isinstance(discovered, list) or len(discovered) > 100:
                 raise ServiceError("SOURCE_BLOCKED", "Registered candidate discovery returned an invalid result.", 422, False)
         by_id = {candidate["id"]: candidate for candidate in existing}
@@ -521,7 +560,8 @@ class RagService:
         if self.collector is not None and allow_collection:
             emit("FETCHING", candidate_count=len(discovered))
             collected = self.collector.collect(item_id, question, query["queries"], inputs, user_id,
-                selected_candidate_ids=sorted(selected & discovery_ids), candidates=discovered)
+                selected_candidate_ids=sorted(selected & discovery_ids), candidates=discovered,
+                retry_failed=retry_failed)
             if (not isinstance(collected, dict) or collected.get("status") not in
                     {"FETCHED", "INDEXED", "FAILED", "BLOCKED", "NO_RESULTS"} or
                     not isinstance(collected.get("linked", []), list)):
@@ -595,9 +635,11 @@ class RagService:
                 usable.append(candidate)
             except ServiceError:
                 errors.append(_error("SOURCE_BLOCKED", "The source is not approved for this action."))
-        if not any(candidate["own_document"] for candidate in usable):
+        own_ready = self._own_documents_ready(candidates, manifest, state["user_id"])
+        if not own_ready:
             missing.append("own_document:approved_indexed_body_required")
             errors.append(_error("OWN_DOCUMENT_MISSING", "The selected item's own approved document is unavailable."))
+        conflicts.extend(self._version_conflicts(usable, inputs))
         missing.extend(field for field in APPLICABILITY_FIELDS if not inputs.get(field))
         if not revision:
             errors.append(_error("INDEX_EMPTY", "No compatible document index is active.", True))
@@ -640,7 +682,7 @@ class RagService:
         evidence = [metadata_evidence] + chunks
         for index, entry in enumerate(evidence, 1):
             entry["number"] = index
-        status = "INDEX_READY" if any(candidate["own_document"] for candidate in usable) else "DOC_BLOCKED"
+        status = "INDEX_READY" if own_ready else "DOC_BLOCKED"
         # Cache collection identity independently from the question; no network
         # call is ever made by this lookup. Stored body reuse survives failures.
         collection_cache_hits = 0
@@ -912,8 +954,9 @@ class RagService:
         versions = set(json.loads(manifest["version_ids_json"])) if manifest else set()
         missing = [field for field in APPLICABILITY_FIELDS if not inputs.get(field)]
         conflicts = []
-        own_ready = False
+        own_ready = self._own_documents_ready(candidates, manifest, user_id)
         documents = []
+        usable = []
         for candidate in candidates:
             try:
                 self.registry._require(candidate["source_id"], "local_embed", user_id, candidate["version_id"])
@@ -923,12 +966,13 @@ class RagService:
             if (candidate["version_id"] not in versions or
                     not self.vectors.has_document(item_id, manifest["revision"], candidate["version_id"], candidate["role"])):
                 continue
-            own_ready |= candidate["own_document"]
+            usable.append(candidate)
             issues, clashes = applicability_issues(inputs, json.loads(candidate["applicability_json"]))
             missing.extend(issues)
             conflicts.extend(clashes)
             documents.append({"version_id": candidate["version_id"], "title": candidate["title"],
                 "role": candidate["role"], "url": candidate["canonical_url"], "body_hash": candidate["body_hash"]})
+        conflicts.extend(self._version_conflicts(usable, inputs))
         if not own_ready:
             missing.append("own_document:approved_indexed_body_required")
         result = {"item_id": item_id, "classification": "NEEDS_INFORMATION", "conditions": [],
@@ -970,6 +1014,9 @@ class RagService:
         active = self._active()
         eligibility = bool(active and result["revision"] == active["revision"] and result["applicability_ok"])
         current_candidates = {(candidate["version_id"], candidate["role"]): candidate for candidate in self.registry.candidates(item_id)}
+        own_ready = self._own_documents_ready(current_candidates.values(), active, actor)
+        current_conflicts = self._version_conflicts(current_candidates.values(), result["applicability"])
+        eligibility &= own_ready and not current_conflicts
         hashes = []
         for entry in result["evidence"]:
             if entry["source_type"] == "metadata":
@@ -987,6 +1034,11 @@ class RagService:
             except ServiceError:
                 eligibility = False
         projected = self._display_projection(result, actor)
+        if not own_ready:
+            projected["missing_information"] = list(dict.fromkeys(
+                projected["missing_information"] + ["own_document:approved_indexed_body_required"]))
+            projected["readiness"] = {"status": "DOC_BLOCKED", "reasons": ["OWN_DOCUMENT_MISSING"]}
+        projected["conflicts"] = list(dict.fromkeys(projected["conflicts"] + current_conflicts))
         return {**projected, "applicability_ok": bool(eligibility),
             "conditions_ok": bool(eligibility and projected["conditions_ok"]),
             "document_hashes": sorted(set(hashes)), "classification": projected["classification"] if eligibility else "NEEDS_INFORMATION"}

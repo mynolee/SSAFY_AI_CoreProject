@@ -250,15 +250,16 @@ class Collector:
                        if candidate["version_id"] is None else None])
 
     def collect(self, item_id, question, queries, applicability, actor, *, selected_candidate_ids=None,
-                candidates=None, refresh=False):
+                candidates=None, refresh=False, retry_failed=False):
         terms, scope = self._inputs(item_id, question, queries, applicability, actor)
-        if type(refresh) is not bool or selected_candidate_ids is not None and (
+        if type(refresh) is not bool or type(retry_failed) is not bool or selected_candidate_ids is not None and (
                 not isinstance(selected_candidate_ids, list) or len(selected_candidate_ids) > 1000
                 or any(not isinstance(identifier, str) for identifier in selected_candidate_ids)):
             _invalid()
         with self._lock:
             inventory = self._inventory(item_id)
-            discovered = self.discover(item_id, question, queries, applicability, actor, refresh=refresh) if candidates is None else candidates
+            discovered = self.discover(item_id, question, queries, applicability, actor,
+                                       refresh=refresh or retry_failed) if candidates is None else candidates
             if not isinstance(discovered, list):
                 _invalid()
             for supplied in discovered:
@@ -277,7 +278,7 @@ class Collector:
                       "cache_hits": 0, "errors": [], "cache_keys": []}
             if not selected:
                 key = digest([item_id, scope, sorted(normalize(term).casefold() for term in terms), "NO_RESULTS"])
-                cached = None if refresh else self._cache_get("collection_fetch", key)
+                cached = None if refresh or retry_failed else self._cache_get("collection_fetch", key)
                 result["cache_hits"] = int(bool(cached and cached["status"] == "NO_RESULTS"))
                 result["cache_keys"] = [key]
                 self._cache_put("collection_fetch", key, "NO_RESULTS", {"item_id": item_id}, self.no_results_ttl)
@@ -291,6 +292,10 @@ class Collector:
                     # Recheck rights before every cache read or body reuse.
                     self._require(candidate, actor, _READ_ACTIONS)
                     cached = None if refresh else self._cache_get("collection_fetch", key)
+                    # A job retry bypasses only a negative result. Successful
+                    # bodies still survive an index failure without refetching.
+                    if retry_failed and cached and cached["status"] in {"FAILED", "NO_RESULTS"}:
+                        cached = None
                     version_id = candidate["version_id"]
                     if not version_id and cached and cached["status"] == "FAILED":
                         result["errors"].append(cached["value"]["error"])
