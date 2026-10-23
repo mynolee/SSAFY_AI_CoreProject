@@ -761,6 +761,7 @@ class RagService:
         if answer["missing_information"] or answer["conflicts"] or state["readiness"]["status"] != "INDEX_READY":
             if answer["classification"] != "NEEDS_INFORMATION":
                 answer["answer"] = "이전 가능 여부를 확정할 수 없습니다. 적용 계약, 필수 문서와 미확인 사항을 확인해 주세요."
+                answer["claims"] = []
                 if numbers:
                     answer["answer"] += " 검토 자료: " + " ".join(f"[{number}]" for number in sorted(numbers))
             answer["classification"] = "NEEDS_INFORMATION"

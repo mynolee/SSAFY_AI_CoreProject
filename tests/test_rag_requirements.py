@@ -49,6 +49,20 @@ class RagRequirementTests(unittest.TestCase):
         self.assertEqual(table["readiness"]["status"], "DOC_BLOCKED")
         self.assertIn("own_document:approved_indexed_body_required", table["missing_information"])
 
+    def test_server_overruled_answer_omits_unsupported_claims_including_cached_reply(self):
+        self.document(body=b"<h1>SYNTHETIC terms</h1>Transfer is permitted.")
+        self.rag.prepare("buyer", self.item)
+        incomplete = {key: value for key, value in fixtures.INPUTS.items() if key != "enrollment_date"}
+        with patch.object(self.model, "generate", side_effect=self.unconditional_terms):
+            for _ in range(2):
+                answer = self.rag.ask("buyer", self.item, "Confirm this incomplete contract", incomplete)
+                self.assertEqual("NEEDS_INFORMATION", answer["classification"])
+                self.assertFalse(answer["applicability_ok"])
+                self.assertFalse(answer["conditions_ok"])
+                self.assertEqual([], answer["claims"])
+                self.assertTrue(answer["cited_evidence_ids"])
+                self.assertNotIn("Transfer is permitted.", answer["answer"])
+
     def test_uncited_required_source_revocation_cannot_be_masked_by_cited_terms(self):
         self.document(body=b"<h1>SYNTHETIC terms</h1>Transfer is permitted.")
         description = self.document(body=b"<h1>SYNTHETIC description</h1>Item description.",
