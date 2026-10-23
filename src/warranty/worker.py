@@ -85,12 +85,25 @@ class SettlementWorker:
                 trades.add(op["trade_id"])
                 groups.add(op["group_id"])
                 audit(conn, op["trade_id"], "worker", "recovery", op["operation_id"], "UNKNOWN_RESERVATION_PRESERVED")
+            recovered = {(op["operation_id"], op["attempt_no"]) for op in rows}
             for gid in groups:
-                conn.execute("UPDATE jobs SET status='UNKNOWN' WHERE group_id=? AND status IN ('PENDING','PROCESSING')", (gid,))
+                # Retry jobs share the original group, but own separate attempts.
+                # Recover only jobs that actually claimed a recovered attempt.
+                for job in conn.execute("SELECT * FROM jobs WHERE group_id=? AND status IN ('PENDING','PROCESSING')", (gid,)):
+                    if recovered.intersection(tuple(attempt) for attempt in json.loads(job["attempts_json"])):
+                        conn.execute("UPDATE jobs SET status='UNKNOWN' WHERE job_id=?", (job["job_id"],))
                 update_group(conn, gid)
             for tid in trades:
                 conn.execute("UPDATE trades SET version=version+1 WHERE trade_id=?", (tid,))
             return len(rows)
+
+    @staticmethod
+    def _has_uncertain_component(conn, operations):
+        components = {(op["trade_id"], op["component"]) for op in operations}
+        return any(conn.execute(
+            "SELECT 1 FROM settlement_operations WHERE trade_id=? AND component=? "
+            "AND status IN ('PROCESSING','UNKNOWN') LIMIT 1", (trade_id, component)
+        ).fetchone() for trade_id, component in components)
 
     def run_pending(self):
         self.recover_processing()
@@ -105,7 +118,8 @@ class SettlementWorker:
                     op = conn.execute("SELECT * FROM settlement_operations WHERE operation_id=? AND attempt_no=? AND status='RESERVED'", (oid, attempt)).fetchone()
                     if op is not None:
                         snapshots.append(dict(op))
-            if len(snapshots) != len(attempts):
+                blocked = self._has_uncertain_component(conn, snapshots)
+            if len(snapshots) != len(attempts) or blocked:
                 continue
             # Fault adapters are isolated from the open write transaction.
             outcomes = {}
@@ -124,6 +138,8 @@ class SettlementWorker:
                     if op is not None:
                         current.append(op)
                 if len(current) != len(attempts):
+                    continue
+                if self._has_uncertain_component(conn, current):
                     continue
                 if any(conn.execute("SELECT 1 FROM disputes WHERE trade_id=? AND status<>'RESOLVED' AND scope IN (?, 'BOTH')", (op["trade_id"], op["component"])).fetchone() for op in current):
                     continue

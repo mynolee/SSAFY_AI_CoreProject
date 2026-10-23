@@ -109,6 +109,17 @@ class TransactionsTest(unittest.TestCase):
         self.assertEqual(800000, current["balances"]["D"]["paid"])
         self.assertEqual(80000, current["balances"]["W"]["held"])
 
+    def test_repeated_receipt_does_not_create_a_new_trade_change(self):
+        trade = self.fund(W=0)
+        with self.db.connect() as conn:
+            accepted = conn.execute("SELECT COUNT(*) FROM audit_events WHERE trade_id=? AND action='receipt'", (trade["trade_id"],)).fetchone()[0]
+        repeated = self.call(trade, "receipt", {"contract_revision": trade["contract_revision"]})
+        self.assertEqual(trade["version"], repeated["version"])
+        self.assertEqual(trade["ledger"], repeated["ledger"])
+        with self.db.connect() as conn:
+            self.assertEqual(1, conn.execute("SELECT COUNT(*) FROM receipt_confirmations WHERE trade_id=?", (trade["trade_id"],)).fetchone()[0])
+            self.assertEqual(accepted, conn.execute("SELECT COUNT(*) FROM audit_events WHERE trade_id=? AND action='receipt'", (trade["trade_id"],)).fetchone()[0])
+
     def test_one_evidence_consent_creates_no_reservation_or_ledger(self):
         trade = self.ready(self.fund(), bilateral=False)
         trade, proposal = self.proposal(trade, [{"component": "W", "pay_won": 80000, "refund_won": 0}])
@@ -264,6 +275,73 @@ class TransactionsTest(unittest.TestCase):
         self.call(trade, "reconcile", {"operation_id": op["operation_id"]})
         self.assertEqual(800000, self.assert_accounts(trade)["balances"]["D"]["paid"])
 
+    def test_unknown_retry_holds_a_separately_queued_sibling_attempt(self):
+        trade = self.ready(self.fund())
+        trade, proposal = self.proposal(trade, [{"component": "W", "pay_won": 50000, "refund_won": 30000}], "mutual_agreement")
+        self.reserve(trade, proposal)
+        SettlementWorker(self.db, lambda op: "FAILED").run_pending()
+        for op in self.assert_accounts(trade)["operations"]:
+            self.call(trade, "retry", {"operation_id": op["operation_id"]})
+        calls = []
+        def unknown_once(op):
+            calls.append(op["operation_id"])
+            return "UNKNOWN"
+        worker = SettlementWorker(self.db, unknown_once)
+        self.assertEqual(1, worker.run_pending()["processed_jobs"])
+        self.assertEqual(1, len(calls))
+        current = self.assert_accounts(trade)
+        self.assertEqual({"UNKNOWN", "RESERVED"}, {op["status"] for op in current["operations"]})
+        self.assertEqual(0, worker.run_pending()["processed_jobs"])
+        self.assertEqual(1, len(calls))
+        unknown = next(op for op in current["operations"] if op["status"] == "UNKNOWN")
+        worker.record_event(unknown["operation_id"], unknown["attempt_no"], "SUCCEEDED")
+        self.call(trade, "reconcile", {"operation_id": unknown["operation_id"]})
+        self.assertEqual(1, SettlementWorker(self.db).run_pending()["processed_jobs"])
+        current = self.assert_accounts(trade)
+        self.assertTrue(all(op["status"] == "SUCCEEDED" for op in current["operations"]))
+        self.assertEqual(50000, current["balances"]["W"]["paid"])
+        self.assertEqual(30000, current["balances"]["W"]["refunded"])
+
+    def test_processing_recovery_preserves_other_jobs_in_the_same_group(self):
+        trade = self.ready(self.fund())
+        trade, proposal = self.proposal(trade, [{"component": "W", "pay_won": 50000, "refund_won": 30000}], "mutual_agreement")
+        self.reserve(trade, proposal)
+        SettlementWorker(self.db, lambda op: "FAILED").run_pending()
+        for op in self.assert_accounts(trade)["operations"]:
+            self.call(trade, "retry", {"operation_id": op["operation_id"]})
+        current = self.assert_accounts(trade)
+        recovering = current["operations"][0]
+        waiting = current["operations"][1]
+        with self.db.transaction() as conn:
+            conn.execute("UPDATE settlement_operations SET status='PROCESSING' WHERE operation_id=?", (recovering["operation_id"],))
+        worker = SettlementWorker(self.db)
+        self.assertEqual(1, worker.recover_processing())
+        with self.db.connect() as conn:
+            waiting_job = next(row for row in conn.execute("SELECT * FROM jobs WHERE group_id=?", (recovering["group_id"],))
+                               if [waiting["operation_id"], waiting["attempt_no"]] in json.loads(row["attempts_json"]))
+            self.assertEqual("PENDING", waiting_job["status"])
+        self.assertEqual(0, worker.run_pending()["processed_jobs"])
+        worker.record_event(recovering["operation_id"], recovering["attempt_no"], "SUCCEEDED")
+        self.call(trade, "reconcile", {"operation_id": recovering["operation_id"]})
+        self.assertEqual(1, worker.run_pending()["processed_jobs"])
+        current = self.assert_accounts(trade)
+        self.assertTrue(all(op["status"] == "SUCCEEDED" for op in current["operations"]))
+
+    def test_unknown_component_allows_an_independent_component_retry(self):
+        trade, proposal = self.proposal(self.fund(D=100, W=80), [
+            {"component": "D", "pay_won": 100, "refund_won": 0},
+            {"component": "W", "pay_won": 0, "refund_won": 80}], "mutual_agreement")
+        self.reserve(trade, proposal)
+        SettlementWorker(self.db, lambda op: "FAILED").run_pending()
+        for op in self.assert_accounts(trade)["operations"]:
+            self.call(trade, "retry", {"operation_id": op["operation_id"]})
+        worker = SettlementWorker(self.db, lambda op: "UNKNOWN" if op["component"] == "D" else "SUCCEEDED")
+        self.assertEqual(2, worker.run_pending()["processed_jobs"])
+        current = self.assert_accounts(trade)
+        self.assertEqual({"D": "UNKNOWN", "W": "SUCCEEDED"}, {op["component"]: op["status"] for op in current["operations"]})
+        self.assertEqual(100, current["balances"]["D"]["pay_reserved"])
+        self.assertEqual(80, current["balances"]["W"]["refunded"])
+
     def test_mixed_allocation_failure_rolls_back_all(self):
         trade = self.fund()
         trade, proposal = self.proposal(trade, [{"component": "D", "pay_won": 800000, "refund_won": 0}, {"component": "W", "pay_won": 80000, "refund_won": 0}])
@@ -392,6 +470,19 @@ class TransactionsTest(unittest.TestCase):
             if attempt < 3:
                 self.call(trade, "retry", {"operation_id": op["operation_id"]})
         self.assert_code("MAX_ATTEMPTS_REACHED", lambda: self.call(trade, "retry", {"operation_id": op["operation_id"]}))
+
+    def test_configured_maximum_attempts_is_enforced_and_validated(self):
+        for value in (True, False, 0, -1, 11, 1.0, "3", None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                TradeService(self.db, max_settlement_attempts=value)
+        self.service = TradeService(self.db, verified_review, max_settlement_attempts=1)
+        trade, proposal = self.proposal(self.fund(W=0), [{"component": "D", "pay_won": 800000, "refund_won": 0}])
+        self.reserve(trade, proposal)
+        SettlementWorker(self.db, lambda op: "FAILED").run_pending()
+        current = self.assert_accounts(trade)
+        op = current["operations"][0]
+        self.assert_code("MAX_ATTEMPTS_REACHED", lambda: self.call(trade, "retry", {"operation_id": op["operation_id"]}))
+        self.assertEqual(current, self.assert_accounts(trade))
 
     def test_review_adoption_binds_new_contract_and_invalidates_consent_receipt(self):
         trade = self.fund()

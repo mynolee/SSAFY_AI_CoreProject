@@ -199,8 +199,12 @@ def verify_accounting(conn, trade_id):
 class TradeService:
     """All identities are server identities, never identities embedded in payloads."""
 
-    def __init__(self, db, review_validator=None, review_guard=None):
+    def __init__(self, db, review_validator=None, review_guard=None, *,
+                 max_settlement_attempts=MAX_SETTLEMENT_ATTEMPTS):
+        if type(max_settlement_attempts) is not int or not 1 <= max_settlement_attempts <= 10:
+            raise ValueError("max_settlement_attempts must be an integer between 1 and 10")
         self.db = db
+        self.max_settlement_attempts = max_settlement_attempts
         self.review_validator = review_validator
         validator_owner = getattr(review_validator, "__self__", None)
         self.review_guard = review_guard or getattr(validator_owner, "review_guard", None)
@@ -599,7 +603,9 @@ class TradeService:
                 fail("BUYER_REQUIRED", status=403)
             if not trade["funded"] or type(payload.get("contract_revision")) is not int or payload.get("contract_revision") != contract["revision"]:
                 fail("FUNDED_CURRENT_CONTRACT_REQUIRED")
-            conn.execute("INSERT OR IGNORE INTO receipt_confirmations(trade_id,contract_revision,actor) VALUES(?,?,?)", (tid, contract["revision"], actor))
+            changed = conn.execute("INSERT OR IGNORE INTO receipt_confirmations(trade_id,contract_revision,actor) VALUES(?,?,?)", (tid, contract["revision"], actor)).rowcount > 0
+            if not changed:
+                return False
             conn.execute("UPDATE trades SET receipt_revision=?,status='ACTIVE' WHERE trade_id=?", (contract["revision"], tid))
         elif action == "adopt_review":
             self._party(trade, actor)
@@ -708,7 +714,7 @@ class TradeService:
             self._party(trade, actor)
             if op["status"] != "FAILED":
                 fail("RETRY_REQUIRES_FAILED", "Only a confirmed failure can be executed again.", 409)
-            if op["attempt_no"] >= MAX_SETTLEMENT_ATTEMPTS:
+            if op["attempt_no"] >= self.max_settlement_attempts:
                 fail("MAX_ATTEMPTS_REACHED", status=409)
             proposal = self._proposal(conn, trade, op["proposal_id"])
             allocation = {"component": op["component"], "pay_won": op["amount"] if op["direction"] == "PAY" else 0, "refund_won": op["amount"] if op["direction"] == "REFUND" else 0}
