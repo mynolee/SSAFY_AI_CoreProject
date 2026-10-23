@@ -10,6 +10,7 @@ from contextvars import ContextVar
 from copy import deepcopy
 import hashlib
 import json
+import re
 
 from .errors import ServiceError
 from .gms import GMSStructuredModel, _blocked, _safe_json
@@ -150,8 +151,31 @@ class GMSPublicStructuredModel(GMSStructuredModel):
             raise ValueError("Unexpected response")
         return message.get("content")
 
+    def _decode_response(self, prepared, response_text):
+        """Recover only absent citation syntax, without another model request."""
+        try:
+            return self._public_protocol.decode(prepared, response_text), 0
+        except ValueError as exc:
+            if prepared.kind != "answer" or str(exc) != "PUBLIC_RESPONSE_MARKER_INVALID":
+                raise
+        value = _safe_json(response_text)
+        text, citations = value.get("answer"), value.get("citations")
+        # Existing, partial, bare or parenthetical label references are never
+        # corrected. A recovery only renders the model's already valid labels.
+        if (type(text) is not str or "[" in text or "]" in text
+                or re.search(r"(?<![A-Za-z0-9_])S[0-9]+(?![A-Za-z0-9_])", text, re.IGNORECASE)
+                or type(citations) is not list or not citations
+                or any(type(label) is not str or label not in prepared.label_to_number for label in citations)
+                or len(citations) != len(set(citations))):
+            raise ValueError("PUBLIC_RESPONSE_MARKER_INVALID")
+        value["answer"] = text + " " + " ".join("[" + label + "]" for label in citations)
+        # Run the complete strict decoder again, including checks that follow
+        # marker validation, such as condition shape and source membership.
+        return self._public_protocol.decode(prepared, json.dumps(value, ensure_ascii=False, allow_nan=False)), 1
+
     def generate(self, kind, prompt):
         self._last_response.model = None
+        self._last_response.local_citation_marker_recovery = 0
         self._gateway.reset()
         self._require_execution()
         context_token = self._validated_contexts.set([])
@@ -168,11 +192,12 @@ class GMSPublicStructuredModel(GMSStructuredModel):
                 raise _blocked() from None
             result = self._gateway.request(self.route, prepared.body, "chat")
             try:
-                answer = self._public_protocol.decode(prepared, self._response_text(result))
+                answer, marker_recovery = self._decode_response(prepared, self._response_text(result))
                 answer = validate_output(kind, answer,
                     allowed_candidate_ids=[row.get("id") for row in variables.get("candidates", [])],
                     allowed_evidence_ids=[row.get("evidence_id") for row in variables.get("evidence", [])])
                 self._last_response.model = result["model"]
+                self._last_response.local_citation_marker_recovery = marker_recovery
                 return answer
             except (TypeError, ValueError, KeyError, RecursionError, ServiceError):
                 raise _error("MODEL_OUTPUT_INVALID") from None
@@ -188,5 +213,7 @@ class GMSPublicStructuredModel(GMSStructuredModel):
         result = super().metadata()
         result.update(public_protocol_only=True, format_repair_attempts=0,
                       structured_output="PUBLIC_PROTOCOL_AND_LOCAL_VALIDATION",
-                      private_policy_transmitted=False)
+                      private_policy_transmitted=False,
+                      local_citation_marker_recovery=getattr(
+                          self._last_response, "local_citation_marker_recovery", 0))
         return result

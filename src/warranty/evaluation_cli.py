@@ -72,11 +72,16 @@ def _metadata(model, *, embedding=False):
     allowed = {"provider", "model_id", "model_version", "version_source", "provider_reported_model",
                "is_mock", "is_remote", "can_generate", "authorization", "temperature", "sampling", "generation_settings", "transport_settings",
                "name", "dimension", "route", "configuration_ready", "live_execution_required", "live_verified", "version_source"}
-    return _json_copy({key: part for key, part in result.items() if key in allowed})
+    projected = {key: part for key, part in result.items() if key in allowed}
+    marker_recovery = result.get("local_citation_marker_recovery")
+    if type(marker_recovery) is int and marker_recovery in (0, 1):
+        projected["local_citation_marker_recovery"] = marker_recovery
+    return _json_copy(projected)
 
 
 def _stable_model(metadata):
-    return {key: part for key, part in metadata.items() if key != "provider_reported_model"}
+    return {key: part for key, part in metadata.items()
+            if key not in {"provider_reported_model", "local_citation_marker_recovery"}}
 
 
 def _runtime_snapshot(app):

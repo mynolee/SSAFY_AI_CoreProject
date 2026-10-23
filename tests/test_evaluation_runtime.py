@@ -211,6 +211,22 @@ class RuntimeEvaluationTests(unittest.TestCase):
             self.assertNotIn("REFERENCE-ONLY-NEVER-SEND", json.dumps(inputs))
         self.assertTrue(self.app.rag.model.scopes)
 
+    def test_per_response_citation_telemetry_is_recorded_without_configuration_drift(self):
+        model = self.app.rag.model
+        original_metadata = model.metadata
+
+        def metadata():
+            return {**original_metadata(), "local_citation_marker_recovery": len(model.inputs) % 2}
+
+        model.metadata = metadata
+        result = run_evaluation(self.app, self.cases, {**self.config, "comparisons": ["answers"]})
+        self.assertEqual("COLLECTED", result["status"])
+        artifact = self.load(result, "answers")
+        captured = [call["model_metadata_after"]["local_citation_marker_recovery"]
+                    for pair in artifact["results"] for run in pair["runs"].values()
+                    for call in run["raw_response"]["raw_model_calls"]]
+        self.assertEqual({0, 1}, set(captured))
+
     def test_no_rag_excludes_item_metadata_and_evidence_but_uses_same_policy_model(self):
         result = run_evaluation(self.app, self.cases, {**self.config, "comparisons": ["answers"]})
         artifact = self.load(result, "answers")

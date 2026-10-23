@@ -287,6 +287,67 @@ class PublicGMSTests(unittest.TestCase):
         self.assertEqual(len(self.credit.settlements), 1)
         self.assertEqual(model.format_repair_attempts, 0)
 
+    def test_absent_answer_markers_render_only_existing_citations_with_one_request(self):
+        model = self.model()
+        text = "An authored public example requires written confirmation."
+        self.result = response(json.dumps({"answer": text, "citations": ["S1"],
+            "conditions": [{"text": "Written confirmation.", "citations": ["S1"]}]}))
+        answer = self.call(model, "answer")
+        self.assertEqual(answer["answer"], text + " [7]")
+        self.assertEqual(answer["classification"], "NEEDS_INFORMATION")
+        self.assertEqual(answer["cited_evidence_ids"], [SOURCE["local_id"]])
+        self.assertEqual(answer["conditions"], [{"text": "Written confirmation.",
+                                                "evidence_ids": [SOURCE["local_id"]]}])
+        self.assertEqual(model.metadata()["local_citation_marker_recovery"], 1)
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(len(self.credit.reservations), 1)
+        self.assertEqual(len(self.credit.settlements), 1)
+        self.assertEqual(model.format_repair_attempts, 0)
+
+    def test_local_marker_recovery_rejects_partial_bare_unknown_and_duplicate_references(self):
+        model = self.model()
+        invalid = [
+            {"answer": "An example [S1", "citations": ["S1"]},
+            {"answer": "An example ]", "citations": ["S1"]},
+            {"answer": "An example S999", "citations": ["S1"]},
+            {"answer": "An example S1", "citations": ["S1"]},
+            {"answer": "예시 조항 S1참고", "citations": ["S1"]},
+            {"answer": "An example [S999]", "citations": ["S1"]},
+            {"answer": "An example.", "citations": ["S999"]},
+            {"answer": "An example.", "citations": ["S1", "S1"]},
+        ]
+        for reply in invalid:
+            with self.subTest(reply=reply):
+                self.result = response(json.dumps(reply))
+                before = len(self.requests)
+                self.assert_code("MODEL_OUTPUT_INVALID", lambda: self.call(model, "answer"))
+                self.assertEqual(len(self.requests), before + 1)
+                self.assertEqual(model.metadata()["local_citation_marker_recovery"], 0)
+
+    def test_local_marker_recovery_still_validates_condition_shape_and_membership(self):
+        model = self.model()
+        for conditions in ([{"text": "An example condition.", "citations": ["S999"]}],
+                           [{"text": "An example condition.", "citations": ["S1"], "fulfilled": True}]):
+            with self.subTest(conditions=conditions):
+                self.result = response(json.dumps({"answer": "An authored example.", "citations": ["S1"],
+                                                  "conditions": conditions}))
+                before = len(self.requests)
+                self.assert_code("MODEL_OUTPUT_INVALID", lambda: self.call(model, "answer"))
+                self.assertEqual(len(self.requests), before + 1)
+                self.assertEqual(model.metadata()["local_citation_marker_recovery"], 0)
+
+    def test_local_marker_telemetry_resets_on_strict_success_and_failed_generation(self):
+        model = self.model()
+        for content, expected in (('{"answer":"An example.","citations":["S1"]}', 1),
+                                  ('{"answer":"An example. [S1]","citations":["S1"]}', 0),
+                                  ('{"answer":"An example.","citations":["S1"]}', 1)):
+            self.result = response(content)
+            self.call(model, "answer")
+            self.assertEqual(model.metadata()["local_citation_marker_recovery"], expected)
+        self.result = response("not JSON")
+        self.assert_code("MODEL_OUTPUT_INVALID", lambda: self.call(model, "answer"))
+        self.assertEqual(model.metadata()["local_citation_marker_recovery"], 0)
+
     def test_http_failure_does_not_retry_and_unknown_model_freezes_shared_credit(self):
         model = self.model()
         self.http_status = 503
@@ -325,17 +386,21 @@ class PublicGMSTests(unittest.TestCase):
             barrier.wait(timeout=5)
             self.assertEqual(user["sources"][0]["excerpt"],
                              OTHER_SOURCE["excerpt"] if user["question"] == QUESTION_TWO else SOURCE["excerpt"])
-            return httpx.Response(200, json=response('{"answer":"Public concurrent answer [S1]","citations":["S1"]}'))
+            text = "Public concurrent answer" + ("" if user["question"] == QUESTION else " [S1]")
+            return httpx.Response(200, json=response(json.dumps({"answer": text, "citations": ["S1"]})))
 
         model = self.model(public_source_resolver=resolve, transport=httpx.MockTransport(transport))
         rows = [(QUESTION, "PRIVATE-A", 7), (QUESTION_TWO, "PRIVATE-B", 9)]
 
         def run(row):
             question, identity, number = row
-            return self.call(model, "answer", variables("answer", question, local_id=identity, number=number))
+            result = self.call(model, "answer", variables("answer", question, local_id=identity, number=number))
+            return result, model.metadata()["local_citation_marker_recovery"]
 
         with ThreadPoolExecutor(max_workers=2) as pool:
-            results = list(pool.map(run, rows))
+            outputs = list(pool.map(run, rows))
+        results = [output[0] for output in outputs]
+        self.assertEqual([output[1] for output in outputs], [1, 0])
         self.assertEqual([result["cited_evidence_ids"] for result in results], [["PRIVATE-A"], ["PRIVATE-B"]])
         self.assertEqual([result["answer"] for result in results],
                          ["Public concurrent answer [7]", "Public concurrent answer [9]"])
