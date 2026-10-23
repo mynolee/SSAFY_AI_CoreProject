@@ -247,6 +247,23 @@ class RuntimeEvaluationTests(unittest.TestCase):
         self.assertEqual(artifact["status"], "INCOMPLETE")
         self.assertFalse(artifact["sample_requirement_met"])
         self.assertEqual(len(artifact["samples"]), 20)
+        self.assertEqual(artifact["exclusion_counts"], {"INDEX_NOT_PREPARED": 4})
+        all_times = sorted(sample["run"]["elapsed_seconds"] for sample in artifact["samples"])
+        self.assertEqual(artifact["all_attempt_p50_seconds"], all_times[9])
+        self.assertEqual(artifact["all_attempt_p95_seconds"], all_times[18])
+
+    def test_failed_performance_attempts_keep_latency_and_reason_counts(self):
+        def unavailable(*args, **kwargs):
+            raise ServiceError("MODEL_UNAVAILABLE")
+        self.app.rag.model.generate = unavailable
+        result = run_evaluation(self.app, self.cases, {**self.config, "comparisons": ["performance"]})
+        artifact = self.load(result, "performance")
+        self.assertEqual(artifact["attempt_count"], 20)
+        self.assertEqual(artifact["prepared_success_count"], 0)
+        self.assertEqual(artifact["exclusion_counts"], {"MODEL_UNAVAILABLE": 20})
+        self.assertIsNone(artifact["p95_seconds"])
+        self.assertGreaterEqual(artifact["all_attempt_p95_seconds"], 0)
+        self.assertEqual(result["status"], "INCOMPLETE")
 
     def test_cold_preparation_is_separate_from_unmeasured_external_collection(self):
         result = run_evaluation(self.app, self.cases, {**self.config, "comparisons": ["performance"], "measure_cold_prepare": True})

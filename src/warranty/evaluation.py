@@ -24,6 +24,12 @@ from .errors import ServiceError
 _SCHEMA = "comparison-collector-v1"
 _OWN_ROLES = {"PRIMARY_DESCRIPTION", "SERVICE_TERMS", "INSURANCE_TERMS"}
 _CODE = re.compile(r"[A-Z][A-Z0-9_]{0,79}\Z")
+_REVIEW_SCHEMA = "evaluation-answer-review-v1"
+_REVIEW_OUTCOMES = {
+    "accuracy": {"CORRECT", "INCORRECT", "UNVERIFIED", "NOT_APPLICABLE"},
+    "evidence": {"SUPPORTED", "UNSUPPORTED", "NO_CLAIMS", "UNVERIFIED"},
+    "uncertainty": {"APPROPRIATE", "INAPPROPRIATE", "NOT_APPLICABLE", "UNVERIFIED"},
+}
 
 
 def _error(code="EVALUATION_INVALID", message="비교 평가 설정과 입력을 확인해 주세요.", status=422):
@@ -49,6 +55,155 @@ def _json_copy(value):
     # Round-tripping rejects custom/non-JSON values rather than recording reprs
     # that might disclose local objects, credentials, or exception internals.
     return json.loads(_canonical(value))
+
+
+def _answer_artifact(artifact):
+    """Check integrity, not authenticity of a supplied local collector artifact."""
+    if not isinstance(artifact, dict):
+        _error("EVALUATION_ARTIFACT_INVALID")
+    unsigned = {key: value for key, value in artifact.items() if key not in {"artifact_fingerprint", "output_path"}}
+    if (artifact.get("schema_version") != _SCHEMA or artifact.get("comparison") != "answers"
+            or artifact.get("artifact_fingerprint") != _hash(unsigned)
+            or not isinstance(artifact.get("mode"), str) or artifact["mode"] not in {"MOCK", "LIVE"}
+            or not isinstance(artifact.get("context"), dict)
+            or not isinstance(artifact.get("results"), list)):
+        _error("EVALUATION_ARTIFACT_INVALID")
+    inputs = artifact.get("inputs")
+    if (not isinstance(inputs, dict) or type(artifact.get("failed_count")) is not int
+            or artifact["failed_count"] < 0):
+        _error("EVALUATION_ARTIFACT_INVALID")
+    cases = ComparisonRunner._cases(inputs.get("cases"))
+    context = artifact["context"]
+    if (len(artifact["results"]) != len(cases) or artifact.get("case_count") != len(cases)
+            or artifact.get("attempt_count") != 2 * len(cases)
+            or context.get("mode") != artifact["mode"]
+            or context.get("config_fingerprint") != artifact.get("config_fingerprint")
+            or _hash({key: part for key, part in context.items() if key != "config_fingerprint"}) != artifact.get("config_fingerprint")
+            or _hash(inputs) != artifact.get("input_fingerprint")):
+        _error("EVALUATION_ARTIFACT_INVALID")
+    for case, pair in zip(cases, artifact["results"]):
+        if (not isinstance(pair, dict) or pair.get("case") != case
+                or not isinstance(pair.get("runs"), dict)
+                or set(pair["runs"]) != {"no_rag", "rag"}
+                or any(not isinstance(run, dict) or run.get("status") not in {"COLLECTED", "FAILED"}
+                       or run.get("status") == "COLLECTED" and "raw_response" not in run
+                       for run in pair["runs"].values())):
+            _error("EVALUATION_ARTIFACT_INVALID")
+    failures = sum(run["status"] == "FAILED" for pair in artifact["results"] for run in pair["runs"].values())
+    if artifact["failed_count"] != failures or artifact.get("collected_count") != 2 * len(cases) - failures:
+        _error("EVALUATION_ARTIFACT_INVALID")
+    return artifact
+
+
+def answer_review_template(artifact):
+    """Create an ungraded, immutable-response-bound review worksheet.
+
+    References remain the ones supplied before collection. Reviewers must check
+    their source and applicability independently; a declared VERIFIED reference
+    is not independently authenticated by this module.
+    """
+    artifact = _answer_artifact(artifact)
+    results = []
+    for pair in artifact["results"]:
+        for variant, run in pair["runs"].items():
+            if run["status"] != "COLLECTED":
+                continue
+            results.append({"case_id": pair["case"]["case_id"], "variant": variant,
+                "response_fingerprint": _hash(run["raw_response"]),
+                "reference": deepcopy(pair["case"].get("reference")),
+                "assessment": {name: {"outcome": "UNREVIEWED", "rationale": "", "reference_ids": []}
+                               for name in _REVIEW_OUTCOMES}})
+    return {"schema_version": _REVIEW_SCHEMA,
+            "source_artifact_fingerprint": artifact["artifact_fingerprint"],
+            "reviewer": "", "reviewer_type": "HUMAN", "reviewed_at_utc": "", "results": results}
+
+
+def _reference_ids(reference):
+    """IDs from pre-collection reference sources with a concrete locator."""
+    if not isinstance(reference, dict) or reference.get("status") != "VERIFIED":
+        return set()
+    sources = reference.get("sources")
+    if not isinstance(sources, list):
+        return set()
+    ids = [part["evidence_id"] for part in sources if isinstance(part, dict)
+           and _text(part.get("evidence_id")) and _text(part.get("locator"))]
+    return set(ids)
+
+
+def assessed_answer_review(artifact, review):
+    """Validate explicit reviewer judgments and summarize them without grading.
+
+    Review identity and source correctness are reviewer-reported. Fingerprints
+    prevent accidentally applying a worksheet to different collected responses;
+    they are not signatures or proof of a human's identity.
+    """
+    template = answer_review_template(artifact)
+    review = _json_copy(review)
+    if (not isinstance(review, dict) or set(review) != set(template)
+            or review.get("schema_version") != _REVIEW_SCHEMA
+            or review.get("source_artifact_fingerprint") != template["source_artifact_fingerprint"]
+            or not _text(review.get("reviewer")) or len(review["reviewer"]) > 200
+            or not isinstance(review.get("reviewer_type"), str) or review["reviewer_type"] not in {"HUMAN", "AGENT_ASSISTED"}
+            or not isinstance(review.get("results"), list)):
+        _error("EVALUATION_REVIEW_INVALID")
+    try:
+        reviewed = datetime.fromisoformat(review["reviewed_at_utc"].replace("Z", "+00:00"))
+        if reviewed.tzinfo is None or reviewed.utcoffset().total_seconds() != 0:
+            raise ValueError()
+    except (AttributeError, TypeError, ValueError):
+        _error("EVALUATION_REVIEW_INVALID")
+    expected = {(row["case_id"], row["variant"]): row for row in template["results"]}
+    seen, counts = set(), {name: {outcome: 0 for outcome in sorted(outcomes)}
+                          for name, outcomes in _REVIEW_OUTCOMES.items()}
+    variant_counts = {variant: deepcopy(counts) for variant in ("no_rag", "rag")}
+    case_comparisons = {}
+    for row in review["results"]:
+        if (not isinstance(row, dict) or set(row) != {"case_id", "variant", "response_fingerprint", "reference", "assessment"}
+                or not isinstance(row.get("case_id"), str) or not isinstance(row.get("variant"), str)):
+            _error("EVALUATION_REVIEW_INVALID")
+        identity = (row["case_id"], row["variant"])
+        source = expected.get(identity)
+        if (source is None or identity in seen or row["response_fingerprint"] != source["response_fingerprint"]
+                or row["reference"] != source["reference"] or not isinstance(row["assessment"], dict)
+                or set(row["assessment"]) != set(_REVIEW_OUTCOMES)):
+            _error("EVALUATION_REVIEW_INVALID")
+        verified_ids = _reference_ids(source["reference"])
+        for name, outcomes in _REVIEW_OUTCOMES.items():
+            judgment = row["assessment"][name]
+            if (not isinstance(judgment, dict) or set(judgment) != {"outcome", "rationale", "reference_ids"}
+                    or not isinstance(judgment.get("outcome"), str) or judgment["outcome"] not in outcomes
+                    or not _text(judgment.get("rationale")) or len(judgment["rationale"]) > 10000
+                    or not isinstance(judgment.get("reference_ids"), list)
+                    or any(not _text(value) for value in judgment["reference_ids"])
+                    or len(set(judgment["reference_ids"])) != len(judgment["reference_ids"])
+                    or set(judgment["reference_ids"]) - verified_ids):
+                _error("EVALUATION_REVIEW_INVALID")
+            # A positive/negative accuracy or grounding claim needs independently
+            # checked reference material already recorded before generation.
+            substantive = (name == "accuracy" and judgment["outcome"] in {"CORRECT", "INCORRECT"}
+                           or name == "evidence" and judgment["outcome"] in {"SUPPORTED", "UNSUPPORTED"})
+            if substantive and not judgment["reference_ids"]:
+                _error("EVALUATION_REFERENCE_UNVERIFIED")
+            counts[name][judgment["outcome"]] += 1
+            variant_counts[row["variant"]][name][judgment["outcome"]] += 1
+        case_comparisons.setdefault(row["case_id"], {})[row["variant"]] = {
+            name: judgment["outcome"] for name, judgment in row["assessment"].items()}
+        seen.add(identity)
+    if not seen:
+        _error("EVALUATION_REVIEW_INVALID")
+    return {"schema_version": "evaluation-answer-review-report-v1", "review": review,
+            "source_artifact_fingerprint": artifact["artifact_fingerprint"],
+            "source_mode": artifact["mode"], "reviewer_type": review["reviewer_type"],
+            "status": "REVIEWED" if len(seen) == len(expected) else "PARTIAL",
+            "source_collection_status": artifact["status"],
+            "reviewed_response_count": len(seen), "collected_response_count": len(expected),
+            "unreviewed_response_count": len(expected) - len(seen),
+            "failed_response_count": artifact["failed_count"], "outcome_counts": counts,
+            "variant_outcome_counts": variant_counts,
+            "fully_paired_reviewed_case_count": sum(set(pair) == {"no_rag", "rag"} for pair in case_comparisons.values()),
+            "case_comparisons": [{"case_id": case_id, "variants": variants} for case_id, variants in case_comparisons.items()],
+            "acceptance_status": "NOT_ASSESSED", "scores": None,
+            "notice": "Reviewer-reported judgments; reference verification and identity are not independently authenticated. MOCK evidence cannot establish LIVE acceptance."}
 
 
 def _contains_mock(value, *, text_field=False, model_field=False):
@@ -244,7 +399,7 @@ class ComparisonRunner:
         return response, envelope
 
     @staticmethod
-    def _metrics(chunks, request):
+    def _metrics(chunks, request, reference=None):
         if not isinstance(chunks, list) or len(chunks) > request["top_k"]:
             _error("EVALUATION_RETRIEVAL_INVALID")
         chunk_ids, document_ids, version_ids, own_ids, duplicate_keys = [], [], [], [], []
@@ -286,6 +441,11 @@ class ComparisonRunner:
                 own_chunks += 1
                 if _text(document_id):
                     own_ids.append(document_id)
+        required = reference.get("required_evidence_ids") if isinstance(reference, dict) else None
+        declared = (reference.get("status") == "VERIFIED" and isinstance(required, list) and bool(required)
+                    and all(_text(part) for part in required) and len(set(required)) == len(required)) if isinstance(reference, dict) else False
+        expected = set(required) if declared else set()
+        recovered = expected.intersection(chunk_ids)
         return {"chunk_ids": chunk_ids, "returned_chunk_count": len(chunks),
                 "distinct_chunk_id_count": len(set(chunk_ids)),
                 "duplicate_chunk_id_count": len(chunk_ids) - len(set(chunk_ids)),
@@ -293,12 +453,18 @@ class ComparisonRunner:
                 "duplicate_definition": "equal normalized text where supplied; otherwise equal chunk ID",
                 "distinct_document_count": len(set(document_ids)), "document_ids": sorted(set(document_ids)),
                 "unknown_document_identity_count": len(chunks) - len(document_ids),
+                "document_diversity_ratio": len(set(document_ids)) / len(chunks) if chunks and len(document_ids) == len(chunks) else None,
                 "distinct_document_version_count": len(set(version_ids)),
                 "own_document_count": len(set(own_ids)), "own_document_ids": sorted(set(own_ids)),
                 "own_document_chunk_count": own_chunks,
-                "own_document_definition": "explicit own_document flag when present; otherwise linked primary/service/insurance role"}
+                "own_document_definition": "explicit own_document flag when present; otherwise linked primary/service/insurance role",
+                "required_evidence_status": "REFERENCE_DECLARED_VERIFIED" if declared else "NOT_ASSESSED",
+                "required_evidence_count": len(expected) if declared else None,
+                "recovered_required_evidence_ids": sorted(recovered) if declared else None,
+                "missing_required_evidence_ids": sorted(expected - recovered) if declared else None,
+                "required_evidence_recall": len(recovered) / len(expected) if declared else None}
 
-    def _invoke(self, callback, request, *, answers):
+    def _invoke(self, callback, request, *, answers, reference=None):
         entry = {"variant": request["variant"], "status": "FAILED"}
         started = time.perf_counter()
         try:
@@ -323,7 +489,7 @@ class ComparisonRunner:
                 entry["input_context_capture"] = "ADAPTER_REPORTED" if envelope and "input_context" in raw else "NOT_SUPPLIED"
             else:
                 entry["chunks"] = response
-                entry["metrics"] = self._metrics(response, request)
+                entry["metrics"] = self._metrics(response, request, reference=reference)
             entry["execution_provenance"] = "ADAPTER_REPORTED" if envelope else "MOCK_CALLBACK"
             entry["status"] = "COLLECTED"
         except ServiceError as exc:
@@ -365,7 +531,14 @@ class ComparisonRunner:
             pair = {"case": deepcopy(case), "runs": {}}
             for variant, callback in callbacks.items():
                 request = self._request(case, comparison, variant, top_k, filters)
-                pair["runs"][variant] = self._invoke(callback, request, answers=comparison == "answers")
+                pair["runs"][variant] = self._invoke(callback, request, answers=comparison == "answers",
+                                                      reference=case.get("reference"))
+            if comparison == "retrieval" and all(run["status"] == "COLLECTED" for run in pair["runs"].values()):
+                left, right = (pair["runs"][variant]["metrics"] for variant in ("similarity", "mmr"))
+                pair["observed_mmr_minus_similarity"] = {
+                    name: right[name] - left[name] if left[name] is not None and right[name] is not None else None
+                    for name in ("returned_chunk_count", "distinct_document_count", "duplicate_count",
+                                 "own_document_count", "document_diversity_ratio", "required_evidence_recall")}
             results.append(pair)
         runs = [run for case in results for run in case["runs"].values()]
         collected = sum(run["status"] == "COLLECTED" for run in runs)
@@ -390,7 +563,7 @@ class ComparisonRunner:
 
     def save_report(self, comparison, report):
         """Persist a runtime report through the same private-output boundary."""
-        if comparison not in {"runtime", "performance"} or not isinstance(report, dict):
+        if comparison not in {"runtime", "performance", "review-template", "review"} or not isinstance(report, dict):
             _error()
         return self._save({**_json_copy(report), "comparison": comparison,
                            "config_fingerprint": self.config_fingerprint,

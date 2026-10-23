@@ -7,6 +7,7 @@ Reference answers are saved for human evaluation and never enter model input.
 from __future__ import annotations
 
 from contextlib import nullcontext
+from collections import Counter
 from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
@@ -17,7 +18,8 @@ import time
 
 from .documents import APPLICABILITY_FIELDS
 from .errors import ServiceError
-from .evaluation import ComparisonRunner, _canonical, _contains_mock, _hash, _json_copy, _text
+from .evaluation import (ComparisonRunner, answer_review_template, assessed_answer_review,
+                         _canonical, _contains_mock, _hash, _json_copy, _text)
 from .prompts import StructuredRunner
 
 
@@ -252,10 +254,62 @@ class _Runtime:
         method = getattr(self.model, "processing_context", None)
         return method(self.user, item_id) if callable(method) else nullcontext()
 
+    def _public_metadata_local_only(self, case):
+        """Recognize the factory's exact public adapter/local metadata boundary.
+
+        A marker or a manifest is not an authorization exemption. This checks
+        the actual adapter, authorization callbacks and both embedding handles;
+        source/version rights and LIVE/budget checks still run on every request.
+        """
+        from .public_gms import GMSPublicStructuredModel
+        from .public_runtime import PublicProcessingContext
+        from .runtime import AuthorizedChatModel
+        from .vectorstore import MockEmbeddings
+
+        models = getattr(self.app, "models", None)
+        get = models.get if isinstance(models, dict) else lambda key: getattr(models, key, None)
+        context = get("public_context")
+        if not isinstance(context, PublicProcessingContext) or not isinstance(self.model, AuthorizedChatModel):
+            return False
+        adapter = self.model.adapter
+        local_metadata = get("metadata_embedding")
+        protocol = getattr(adapter, "_public_protocol", None)
+        if (not isinstance(adapter, GMSPublicStructuredModel) or get("chat") is not self.model
+                or self.rag.model is not self.model
+                or context.authorization is not getattr(self.app, "authorization", None)
+                or self.model.authorization is not context.authorization
+                or context.authorization.catalog is not self.app.catalog
+                or context.authorization.registry is not self.rag.registry
+                or context.authorization.vectors is not self.rag.vectors
+                or adapter._original_guard != context.model_guard
+                or adapter._public_source_resolver != context.source_resolver
+                or getattr(protocol, "_manifest", None) != context.bundle.protocol
+                or not context.bundle.current()
+                or case["item_id"] not in context.item_ids
+                or hashlib.sha256(case["question"].encode("utf-8")).hexdigest() not in context.bundle.protocol["question_sha256s"]
+                or get("document_item_ids") != list(context.item_ids)
+                or self.rag.document_item_ids != context.item_ids
+                or not isinstance(local_metadata, MockEmbeddings)
+                or local_metadata is not self.rag.vectors.metadata_embeddings
+                or local_metadata is self.embedding
+                or get("embedding") is not self.embedding
+                or self.embedding is not self.rag.vectors.embeddings
+                or getattr(self.embedding, "public_protocol_only", None) is not True
+                or getattr(self.embedding, "_guard", None) != context.embedding_guard
+                or getattr(self.embedding, "approved_document_sha256s", None) != context.document_sha256s):
+            return False
+        return True
+
     def _guard_case(self, case):
         item = self.app.catalog.get(case["item_id"])
         if self.mode == "LIVE":
             if item.get("is_synthetic") is True or case["item_id"].startswith("SYNTHETIC"):
+                _fail("EVALUATION_LIVE_BLOCKED", 403)
+            if self._public_metadata_local_only(case):
+                return item
+            models = getattr(self.app, "models", None)
+            public = models.get("public_context") if isinstance(models, dict) else getattr(models, "public_context", None)
+            if public is not None or getattr(self.model, "public_protocol_only", False) is True:
                 _fail("EVALUATION_LIVE_BLOCKED", 403)
             self.rag.registry.policy.require(item["source_id"], "external_process", actor=self.user,
                                              version_id=self.dataset_hash)
@@ -409,14 +463,58 @@ def _performance(runtime):
         samples.append({"iteration": iteration + 1, "case_id": case["case_id"], "included": eligible,
                         "exclusion_reason": None if eligible else (run.get("error", {}).get("code") or "INDEX_NOT_PREPARED"),
                         "run": run})
+    all_times = [sample["run"]["elapsed_seconds"] for sample in samples]
+    exclusions = Counter(sample["exclusion_reason"] for sample in samples if not sample["included"])
     return runtime.runner.save_report("performance", {"schema_version": "evaluation-performance-v1",
         "created_at_utc": datetime.now(timezone.utc).isoformat(), "status": "COLLECTED" if len(included) >= 20 else "INCOMPLETE",
         "input_fingerprint": _hash([runtime.cases, runtime.iterations, runtime.top_k, runtime.filters]),
         "attempt_count": len(samples), "prepared_success_count": len(included), "excluded_count": len(samples) - len(included),
         "minimum_prepared_samples": 20, "sample_requirement_met": len(included) >= 20,
         "p50_seconds": _percentile(included, 0.5), "p95_seconds": _percentile(included, 0.95),
+        "all_attempt_p50_seconds": _percentile(all_times, 0.5),
+        "all_attempt_p95_seconds": _percentile(all_times, 0.95),
+        "exclusion_counts": dict(sorted(exclusions.items())),
         "percentile_method": "nearest rank over included collector-observed fresh prepared-query latencies",
         "answer_cache": False, "collection_included": False, "samples": samples})
+
+
+def review_evaluation(artifact, output_dir, review=None):
+    """Prepare or record a private answer review without creating an application.
+
+    Inputs accept a trusted server-side mapping or JSON file outside repositories.
+    A template is a draft, with no inferred judgments. A completed review names
+    HUMAN or AGENT_ASSISTED provenance and binds each judgment to the original
+    response. No network, model invocation, or independent human authentication
+    occurs, and no review changes an execution artifact or declares acceptance.
+    """
+    artifact = _private_json(artifact)
+    template = answer_review_template(artifact)
+    context = artifact["context"]
+    keys = ("mode", "model_metadata", "settings", "revision", "dataset_fingerprint",
+            "official_body_count", "external_process_authorized")
+    if any(key not in context for key in keys):
+        _fail("EVALUATION_ARTIFACT_INVALID")
+    runner = ComparisonRunner(output_dir, **{key: context[key] for key in keys})
+    if (runner.config_fingerprint != artifact.get("config_fingerprint")
+            or context.get("config_fingerprint") != runner.config_fingerprint
+            or context["mode"] != artifact["mode"]):
+        _fail("EVALUATION_ARTIFACT_INVALID")
+    if review is None:
+        report = {"schema_version": "evaluation-answer-review-template-v1", "status": "DRAFT",
+                  "source_artifact_fingerprint": artifact["artifact_fingerprint"],
+                  "reviewer_type": None, "review_template": template,
+                  "notice": "Complete review_template with explicit judgments; no outcomes were inferred."}
+        comparison = "review-template"
+    else:
+        review = _private_json(review)
+        # Permit the saved worksheet envelope as well as its review_template.
+        if isinstance(review, dict) and review.get("schema_version") == "evaluation-answer-review-template-v1":
+            review = review.get("review_template")
+        report = assessed_answer_review(artifact, review)
+        comparison = "review"
+    result = runner.save_report(comparison, {**report, "created_at_utc": datetime.now(timezone.utc).isoformat()})
+    return {key: result[key] for key in ("mode", "status", "acceptance_status", "output_path",
+                                       "artifact_fingerprint", "source_artifact_fingerprint", "reviewer_type")}
 
 
 def run_evaluation(app, cases, config):
