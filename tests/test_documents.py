@@ -41,6 +41,23 @@ class ParserTests(unittest.TestCase):
             with self.assertRaises(ServiceError):
                 parse_document(body, kind)
 
+    def test_html_title_is_retained_when_body_has_no_heading(self):
+        sections = parse_document(b"<html><head><title>SYNTHETIC transfer terms</title></head>"
+                                  b"<body><p>Authored transfer condition.</p></body></html>", "HTML")
+        self.assertEqual(sections, [{"section": "SYNTHETIC transfer terms", "text": "Authored transfer condition."}])
+
+    def test_html_inline_markup_preserves_words_and_block_boundaries(self):
+        body = "<h1>Non<strong>transferable</strong></h1><p>가입<strong>이전</strong>금지.</p><p>다음 조건.</p>"
+        sections = parse_document(body.encode("utf-8"), "HTML")
+        self.assertEqual(sections, [{"section": "Nontransferable", "text": "가입이전금지. 다음 조건."}])
+        self.assertEqual(chunk_sections(sections)[0]["section"], "Nontransferable")
+
+    def test_html_hidden_subtrees_do_not_become_terms_or_change_visible_section(self):
+        body = (b"<h1>Visible terms</h1><div hidden><h2>Hidden terms</h2>"
+                b"<span>Hidden claim</span><input>Hidden tail</div>"
+                b"<input hidden><p>Visible claim.</p><template><div>Hidden template</div></template>")
+        self.assertEqual(parse_document(body, "HTML"), [{"section": "Visible terms", "text": "Visible claim."}])
+
 
 class DocumentRegistryTests(unittest.TestCase):
     setUp = fixtures.RagTests.setUp

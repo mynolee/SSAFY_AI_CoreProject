@@ -4,6 +4,7 @@ from contextlib import closing, contextmanager
 import copy
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import threading
 import time
@@ -318,6 +319,55 @@ class CollectionTests(unittest.TestCase):
         self.clock[0] += 6
         self.assertEqual(self.collect()["status"], "FETCHED")
         self.assertEqual(len(self.fetcher.calls), 2)
+
+    def test_fetch_entrypoints_reject_error_pages_and_format_mismatch_before_storage(self):
+        target_id = self.target()
+        target = self.registry.registered_candidates(self.item)[0]
+        responses = [
+            FetchResult(BODY, "text/html", target["url"], 404),
+            FetchResult(BODY, "application/pdf", target["url"], 200),
+            SimpleNamespace(body=BODY, status=200),
+            FetchResult("not bytes", "text/html", target["url"], 200),
+            FetchResult(b"", "text/html", target["url"], 200),
+        ]
+        for response in responses:
+            for entrypoint in ("fetch", "fetch_target"):
+                with self.subTest(response=response, entrypoint=entrypoint):
+                    with patch.object(self.fetcher, "fetch", return_value=response), self.assertRaises(ServiceError) as raised:
+                        if entrypoint == "fetch":
+                            self.registry.fetch("manager", target["document_id"], applicability=SCOPE)
+                        else:
+                            self.registry.fetch_target("manager", target_id)
+                    self.assertEqual(raised.exception.code, "FETCH_FAILED" if response.status != 200 else "PARSE_FAILED")
+                    with closing(self.db.connect()) as connection:
+                        self.assertEqual(connection.execute("SELECT COUNT(*) FROM document_versions").fetchone()[0], 0)
+                    self.assertEqual(list(self.registry.body_dir.iterdir()), [])
+        with closing(self.db.connect()) as connection:
+            self.assertEqual(connection.execute("SELECT status FROM document_fetch_leases").fetchone()[0], "FAILED")
+        # The failed response is not a successful body cache; an allowed retry
+        # really collects and links the authored fixture.
+        self.assertEqual(self.registry.fetch_target("manager", target_id)["item_id"], self.item)
+        self.assertEqual(len(self.fetcher.calls), 1)
+
+    def test_direct_fetch_validates_version_scope_before_request(self):
+        self.target()
+        document_id = self.registry.registered_candidates(self.item)[0]["document_id"]
+        for fields in ({"applicability": {"date_start": "tomorrow"}},
+                       {"applicability": SCOPE, "published_on": "tomorrow"},
+                       {"applicability": SCOPE, "unexpected": "field"}):
+            with self.subTest(fields=fields), self.assertRaises(ServiceError) as raised:
+                self.registry.fetch("manager", document_id, **fields)
+            self.assertEqual(raised.exception.code, "INVALID_INPUT")
+        self.assertEqual(self.fetcher.calls, [])
+
+    def test_direct_fetch_accepts_reviewed_registered_mime_with_charset(self):
+        self.target()
+        target = self.registry.registered_candidates(self.item)[0]
+        response = FetchResult(BODY, " Text/HTML; charset=UTF-8", target["url"], 200)
+        with patch.object(self.fetcher, "fetch", return_value=response):
+            version = self.registry.fetch("manager", target["document_id"], applicability=SCOPE)
+        self.assertEqual(version["section_count"], 1)
+        self.assertFalse(version["reused"])
 
     def test_explicit_refresh_retries_failed_and_refreshes_fetched_body(self):
         self.target()

@@ -44,27 +44,37 @@ def normalize(text):
 
 
 class _HTMLText(HTMLParser):
+    _INERT = {"script", "style", "noscript", "template", "svg"}
+    _VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+    _BLOCK = {"address", "article", "aside", "blockquote", "br", "dd", "div", "dl", "dt", "fieldset",
+              "figcaption", "figure", "footer", "form", "header", "hr", "li", "main", "nav", "ol", "p",
+              "pre", "section", "table", "td", "th", "tr", "ul"}
+
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.sections = []
         self.title = ""
-        self.heading = "본문"
+        self.heading = None
         self.parts = []
-        self.hidden = 0
+        self.hidden = []
         self.in_title = False
         self.in_heading = False
         self.heading_parts = []
 
     def flush(self):
-        text = normalize(" ".join(self.parts))
+        text = normalize("".join(self.parts))
         if text:
-            self.sections.append({"section": self.heading, "text": text})
+            self.sections.append({"section": self.heading or normalize(self.title) or "본문", "text": text})
         self.parts = []
 
     def handle_starttag(self, tag, attrs):
-        if tag in {"script", "style", "noscript", "template", "svg"}:
-            self.hidden += 1
         if self.hidden:
+            if tag not in self._VOID:
+                self.hidden.append(tag)
+            return
+        if tag in self._INERT or any(name == "hidden" for name, _ in attrs):
+            if tag not in self._VOID:
+                self.hidden.append(tag)
             return
         if tag == "title":
             self.in_title = True
@@ -72,20 +82,24 @@ class _HTMLText(HTMLParser):
             self.flush()
             self.in_heading = True
             self.heading_parts = []
-        if tag in {"p", "br", "li", "div", "tr", "td", "section"}:
+        if tag in self._BLOCK:
             self.parts.append(" ")
 
     def handle_endtag(self, tag):
-        if tag in {"script", "style", "noscript", "template", "svg"}:
-            self.hidden = max(0, self.hidden - 1)
-            return
         if self.hidden:
+            # A hidden ancestor also hides nested ordinary elements. A stray
+            # closing tag must not expose the rest of that hidden subtree.
+            if tag in self.hidden:
+                index = len(self.hidden) - 1 - self.hidden[::-1].index(tag)
+                del self.hidden[index:]
             return
         if tag == "title":
             self.in_title = False
         if tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
-            self.heading = normalize(" ".join(self.heading_parts)) or "본문"
+            self.heading = normalize("".join(self.heading_parts)) or "본문"
             self.in_heading = False
+        if tag in self._BLOCK:
+            self.parts.append(" ")
 
     def handle_data(self, data):
         if self.hidden:
@@ -324,6 +338,9 @@ class DocumentRegistry:
 
     def fetch(self, actor, document_id, *, applicability, **version_fields):
         self._manager(actor)
+        if set(version_fields) - {"published_on", "source_version_note"}:
+            raise ServiceError("INVALID_INPUT", "Invalid document version fields.", 422, False)
+        self._validate_scope(applicability, version_fields.get("published_on"), version_fields.get("source_version_note", ""))
         if self.fetcher is None:
             raise ServiceError("SOURCE_BLOCKED", "Network document collection is disabled.", 403, False)
         with closing(self.db.connect()) as connection:
@@ -332,7 +349,28 @@ class DocumentRegistry:
             raise ServiceError("NO_RESULTS", "Registered document was not found.", 404, False)
         self._require(row["source_id"], "fetch", actor)
         response = self.fetcher.fetch(row["source_id"], row["canonical_url"], actor=actor)
-        return self.ingest_bytes(actor, document_id, response.body, applicability=applicability, **version_fields)
+        body = self._response_body(response, row["document_type"])
+        return self.ingest_bytes(actor, document_id, body, applicability=applicability, **version_fields)
+
+    @staticmethod
+    def _response_body(response, document_type):
+        """Apply the registered format contract before storing any fetched text.
+
+        SafeFetcher validates HTTP itself, but every collection entrypoint must
+        enforce the same response contract, including injected source adapters.
+        An HTML error page is not a successfully collected terms document.
+        """
+        status = getattr(response, "status", None)
+        if type(status) is not int or status != 200:
+            raise ServiceError("FETCH_FAILED", "Document request did not return a successful response.", 502, True)
+        content_type = getattr(response, "content_type", None)
+        expected_type = "application/pdf" if document_type == "PDF" else "text/html"
+        if not isinstance(content_type, str) or content_type.split(";", 1)[0].strip().lower() != expected_type:
+            raise ServiceError("PARSE_FAILED", "Document response type does not match its private registration.", 422, False)
+        body = getattr(response, "body", None)
+        if not isinstance(body, bytes) or not body or len(body) > 10 * 1024 * 1024:
+            raise ServiceError("PARSE_FAILED", "Document is empty or exceeds the size limit.", 422, False)
+        return body
 
     def link(self, actor, item_id, version_id, *, role, applicability_basis, locator=""):
         self._manager(actor)
@@ -493,10 +531,8 @@ class DocumentRegistry:
             return {**result, "cache_hit": True}
         try:
             response = self.fetcher.fetch(target["source_id"], target["canonical_url"], actor=actor)
-            expected_type = "application/pdf" if target["document_type"] == "PDF" else "text/html"
-            if getattr(response, "content_type", expected_type).split(";", 1)[0].strip().lower() != expected_type:
-                raise ServiceError("PARSE_FAILED", "Document response type does not match its private registration.", 422, False)
-            version = self.ingest_bytes(actor, target["document_id"], response.body,
+            body = self._response_body(response, target["document_type"])
+            version = self.ingest_bytes(actor, target["document_id"], body,
                 applicability=json.loads(target["applicability_json"]), published_on=target["published_on"], source_version_note=target["source_version_note"])
             with self.policy.read_guard():
                 self._manager(actor)
