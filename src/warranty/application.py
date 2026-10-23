@@ -149,7 +149,8 @@ def build_application(settings: Settings | None = None, metadata_path=None, *, s
             raise ServiceError("APPLICABILITY_UNKNOWN", "보증 검토에 필요한 공식 근거가 준비되지 않았습니다.")
         return validator(*args, **kwargs)
 
-    trades = TradeService(db, review_validator=validate_review, review_guard=rag.review_guard)
+    trades = TradeService(db, review_validator=validate_review, review_guard=rag.review_guard,
+                         max_settlement_attempts=runtime["settlement"]["max_attempts"])
     def manager_check(actor):
         try:
             policy.require_capability(actor, "DATA_MANAGER")

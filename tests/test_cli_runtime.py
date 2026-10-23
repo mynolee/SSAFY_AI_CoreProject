@@ -128,6 +128,43 @@ class CliRuntimeTests(unittest.TestCase):
         app.document_jobs.run_pending.assert_not_called()
         app.worker.run_pending.assert_not_called()
 
+    def test_retry_job_queues_only_the_existing_authorized_request(self):
+        app = self.application()
+        app.document_jobs.retry = Mock(return_value={"job_id": "SYNTHETIC-job", "status": "QUEUED", "attempt_no": 1})
+        with patch("warranty.application.build_application", return_value=app) as build:
+            response = self.run_cli(["retry-job", "--actor", "buyer", "--job-id", "SYNTHETIC-job"])
+        self.assertEqual("QUEUED", response["data"]["status"])
+        app.document_jobs.retry.assert_called_once_with("buyer", "SYNTHETIC-job")
+        self.assertIs(build.call_args.kwargs["start_document_worker"], False)
+        app.document_jobs.run_pending.assert_not_called()
+        app.worker.run_pending.assert_not_called()
+        app.rag.prepare.assert_not_called()
+        app.rag.model.generate.assert_not_called()
+        app.close.assert_called_once()
+
+    def test_offline_evaluation_review_never_constructs_runtime(self):
+        for command, extra, expected_review in (("evaluate-review-template", [], None),
+                ("evaluate-review", ["--review", "SYNTHETIC-review.json"], Path("SYNTHETIC-review.json"))):
+            with self.subTest(command=command), patch("warranty.application.build_application") as build, patch(
+                    "warranty.evaluation_cli.review_evaluation", create=True,
+                    return_value={"status": "DRAFT", "acceptance_status": "NOT_ASSESSED"}) as review:
+                response = self.run_cli([command, "--artifact", "SYNTHETIC-artifact.json", "--output-dir", "SYNTHETIC-output", *extra])
+            self.assertEqual("NOT_ASSESSED", response["data"]["acceptance_status"])
+            build.assert_not_called()
+            review.assert_called_once_with(Path("SYNTHETIC-artifact.json"), Path("SYNTHETIC-output"), review=expected_review)
+
+    def test_offline_evaluation_review_requires_its_inputs_before_runtime_construction(self):
+        for arguments in (["evaluate-review-template"],
+                ["evaluate-review", "--artifact", "SYNTHETIC-artifact.json", "--output-dir", "SYNTHETIC-output"],
+                ["evaluate-review-template", "--artifact", "SYNTHETIC-artifact.json", "--output-dir", "SYNTHETIC-output", "--review", "SYNTHETIC-review.json"]):
+            output = io.StringIO()
+            with self.subTest(arguments=arguments), patch("warranty.application.build_application") as build, redirect_stdout(output):
+                with self.assertRaises(SystemExit) as stopped:
+                    main(arguments)
+            self.assertEqual(1, stopped.exception.code)
+            self.assertEqual("INVALID_INPUT", json.loads(output.getvalue())["error"]["code"])
+            build.assert_not_called()
+
     def test_explicit_metadata_index_uses_server_operator_without_other_work(self):
         app = self.application()
         app.runtime = {"collection": {"manager_actor": "SYNTHETIC-manager"}}

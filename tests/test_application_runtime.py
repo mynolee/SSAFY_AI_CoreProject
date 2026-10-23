@@ -78,6 +78,11 @@ class ApplicationRuntimeTests(unittest.TestCase):
         self.apps.append(app)
         return app
 
+    def test_configured_settlement_limit_reaches_shared_trade_service(self):
+        app = self.build({"settlement": {"max_attempts": 2}})
+        self.assertEqual(2, app.trades.max_settlement_attempts)
+        self.assert_no_external_calls()
+
     def assert_no_external_calls(self):
         self.sdk_chat.assert_not_called()
         self.sdk_embedding.assert_not_called()

@@ -144,6 +144,35 @@ class DocumentJobTests(unittest.TestCase):
             queue.retry("buyer", queued["job_id"])
         self.assertEqual("JOB_RETRY_LIMIT", caught.exception.code)
 
+    def test_dependency_failure_codes_remain_distinct_without_exposing_exception_details(self):
+        codes = ("MODEL_UNAVAILABLE", "EMBEDDING_INPUT_INVALID", "EMBEDDING_OUTPUT_INVALID",
+                 "PROCESSING_APPROVAL_REQUIRED", "USAGE_LIMIT_REACHED", "LIVE_BUDGET_UNCONFIRMED",
+                 "LIVE_BUDGET_UNAVAILABLE", "CREDIT_LIMIT_REACHED", "LIVE_REQUEST_CONFLICT",
+                 "LIVE_PURPOSE_REQUIRED", "LIVE_MODEL_IDENTITY_MISMATCH")
+        for code in codes:
+            for raises in (False, True):
+                with self.subTest(code=code, raises=raises):
+                    def handler(request, progress):
+                        if raises:
+                            raise ServiceError(code, "SYNTHETIC private exception detail", 503, False)
+                        return {"status": "BLOCKED", "failure_code": code}
+                    queue = self.make_queue(handler)
+                    queued = self.enqueue(queue, question=f"SYNTHETIC {code} {raises}")
+                    queue.run_pending()
+                    view = queue.job("buyer", queued["job_id"])
+                    self.assertEqual(code, view["failure_code"])
+                    self.assertNotIn("private exception", json.dumps(view))
+
+    def test_unknown_exception_codes_still_use_safe_fallback(self):
+        def handler(request, progress):
+            raise ServiceError("SYNTHETIC_PRIVATE_UNKNOWN_CODE", "SYNTHETIC private exception detail", 503, True)
+        queue = self.make_queue(handler)
+        queued = self.enqueue(queue)
+        queue.run_pending()
+        view = queue.job("buyer", queued["job_id"])
+        self.assertEqual("DOCUMENT_JOB_FAILED", view["failure_code"])
+        self.assertNotIn("SYNTHETIC_PRIVATE_UNKNOWN_CODE", json.dumps(view))
+
     def test_retry_deduplicates_against_an_already_active_same_request(self):
         queue = self.make_queue(lambda request, progress: {"status": "FAILED", "failure_code": "FETCH_FAILED"})
         original = self.enqueue(queue)

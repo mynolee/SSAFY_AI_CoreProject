@@ -14,8 +14,9 @@ from .errors import ServiceError
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="warranty")
     parser.add_argument("command", choices=("status", "streamlit", "api", "worker", "validate-input",
-        "documents-sync", "documents-import", "index-metadata", "prepare-documents", "document-worker", "job", "evaluate",
-        "live-index-metadata", "live-prepare-documents", "live-query", "public-protocol"))
+        "documents-sync", "documents-import", "index-metadata", "prepare-documents", "document-worker", "job", "retry-job", "evaluate",
+        "live-index-metadata", "live-prepare-documents", "live-query", "public-protocol",
+        "evaluate-review-template", "evaluate-review"))
     parser.add_argument("--metadata", type=Path)
     parser.add_argument("--sha256")
     parser.add_argument("--port", type=int)
@@ -27,6 +28,9 @@ def main(argv=None):
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--cases", type=Path)
     parser.add_argument("--evaluation-config", type=Path)
+    parser.add_argument("--artifact", type=Path)
+    parser.add_argument("--review", type=Path)
+    parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--items", nargs="+")
     parser.add_argument("--live", action="store_true")
     parser.add_argument("--approval-id")
@@ -52,6 +56,13 @@ def main(argv=None):
             if not args.metadata:
                 parser.error("validate-input requires --metadata")
             result = Catalog.load(args.metadata, expected_hash=args.sha256).summary()
+        elif args.command in {"evaluate-review-template", "evaluate-review"}:
+            if (not args.artifact or not args.output_dir
+                    or args.command == "evaluate-review" and not args.review
+                    or args.command == "evaluate-review-template" and args.review is not None):
+                raise ServiceError("INVALID_INPUT", "평가 결과와 검토 입력·저장 경로를 확인해 주세요.", 422, False)
+            from .evaluation_cli import review_evaluation
+            result = review_evaluation(args.artifact, args.output_dir, review=args.review)
         elif args.command == "streamlit":
             script = Path(__file__).resolve().parent / "interfaces" / "streamlit_app.py"
             code = subprocess.call([sys.executable, "-m", "streamlit", "run", str(script),
@@ -97,10 +108,11 @@ def main(argv=None):
                     result = app.rag.enqueue_prepare(actor, args.item, applicability=scope, question=args.question)
                 elif args.command == "document-worker":
                     result = app.document_jobs.run_pending(limit=args.limit)
-                elif args.command == "job":
+                elif args.command in {"job", "retry-job"}:
                     if not actor or not args.job_id:
                         raise ServiceError("INVALID_INPUT", "실행 주체와 작업 ID를 지정해 주세요.", 422, False)
-                    result = app.document_jobs.job(actor, args.job_id)
+                    operation = app.document_jobs.retry if args.command == "retry-job" else app.document_jobs.job
+                    result = operation(actor, args.job_id)
                 elif args.command.startswith("live-"):
                     if not actor:
                         raise ServiceError("FORBIDDEN", "실행 주체를 확인해 주세요.", 403, False)

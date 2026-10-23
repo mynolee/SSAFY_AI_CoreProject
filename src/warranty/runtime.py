@@ -56,7 +56,7 @@ def _text(value, *, optional=False, limit=200):
 
 def load_runtime(settings):
     value = read_private_json(settings.config_dir / "runtime.json", default={}, max_bytes=65536)
-    allowed = {"schema_version", "metadata_path", "metadata_expected_hash", "models", "collection", "retrieval"}
+    allowed = {"schema_version", "metadata_path", "metadata_expected_hash", "models", "collection", "retrieval", "settlement"}
     if not isinstance(value, dict) or set(value) - allowed or type(value.get("schema_version", 1)) is not int or value.get("schema_version", 1) != 1:
         _invalid()
     if "metadata_path" in value:
@@ -79,6 +79,10 @@ def load_runtime(settings):
     retrieval = _section(value.get("retrieval", {}), {
         "chunk_size": 1000, "chunk_overlap": 200, "top_k": 6, "strategy": "similarity",
         "fetch_k": 30, "lambda_mult": 0.5})
+    settlement = _section(value.get("settlement", {}), {
+        "max_attempts": getattr(settings, "max_settlement_attempts", 3)})
+    if type(settlement["max_attempts"]) is not int or not 1 <= settlement["max_attempts"] <= 10:
+        _invalid()
     for field in ("chat_provider", "embedding_provider"):
         if not isinstance(models[field], str) or models[field] not in {"mock", "openai", "gms"}:
             _invalid()
@@ -125,7 +129,7 @@ def load_runtime(settings):
             or not isinstance(retrieval["lambda_mult"], (int, float))
             or not math.isfinite(retrieval["lambda_mult"]) or not 0 <= retrieval["lambda_mult"] <= 1):
         _invalid()
-    return {**value, "models": models, "collection": collection, "retrieval": retrieval}
+    return {**value, "models": models, "collection": collection, "retrieval": retrieval, "settlement": settlement}
 
 
 def load_source_policy(settings, runtime):
