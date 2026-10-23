@@ -63,6 +63,27 @@ class RagRequirementTests(unittest.TestCase):
                 self.assertTrue(answer["cited_evidence_ids"])
                 self.assertNotIn("Transfer is permitted.", answer["answer"])
 
+    def test_needs_information_label_cannot_preserve_contradictory_claims_or_cached_text(self):
+        self.document(body=b"<h1>SYNTHETIC terms</h1>Transfer is permitted.")
+        self.rag.prepare("buyer", self.item)
+        incomplete = {key: value for key, value in fixtures.INPUTS.items() if key != "enrollment_date"}
+
+        def misleading_answer(kind, prompt):
+            answer = self.unconditional_terms(kind, prompt)
+            if kind == "answer":
+                answer["classification"] = "NEEDS_INFORMATION"
+            return answer
+
+        with patch.object(self.model, "generate", side_effect=misleading_answer):
+            for _ in range(2):
+                answer = self.rag.ask("buyer", self.item, "Unverified example contract", incomplete)
+                self.assertEqual("NEEDS_INFORMATION", answer["classification"])
+                self.assertEqual([], answer["claims"])
+                self.assertFalse(answer["applicability_ok"])
+                self.assertFalse(answer["conditions_ok"])
+                self.assertNotIn("Transfer is permitted.", answer["answer"])
+                self.assertTrue(answer["cited_evidence_ids"])
+
     def test_uncited_required_source_revocation_cannot_be_masked_by_cited_terms(self):
         self.document(body=b"<h1>SYNTHETIC terms</h1>Transfer is permitted.")
         description = self.document(body=b"<h1>SYNTHETIC description</h1>Item description.",

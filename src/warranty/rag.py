@@ -759,11 +759,10 @@ class RagService:
             answer["missing_information"].append("applicable_transfer_terms:evidence_required")
         answer["missing_information"] = list(dict.fromkeys(answer["missing_information"]))
         if answer["missing_information"] or answer["conflicts"] or state["readiness"]["status"] != "INDEX_READY":
-            if answer["classification"] != "NEEDS_INFORMATION":
-                answer["answer"] = "이전 가능 여부를 확정할 수 없습니다. 적용 계약, 필수 문서와 미확인 사항을 확인해 주세요."
-                answer["claims"] = []
-                if numbers:
-                    answer["answer"] += " 검토 자료: " + " ".join(f"[{number}]" for number in sorted(numbers))
+            answer["answer"] = "이전 가능 여부를 확정할 수 없습니다. 적용 계약, 필수 문서와 미확인 사항을 확인해 주세요."
+            answer["claims"] = []
+            if numbers:
+                answer["answer"] += " 검토 자료: " + " ".join(f"[{number}]" for number in sorted(numbers))
             answer["classification"] = "NEEDS_INFORMATION"
         if not answer["cited_evidence_ids"]:
             answer["answer"] += "\n확인 가능한 근거를 찾지 못했습니다."
