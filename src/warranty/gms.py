@@ -322,7 +322,7 @@ class _ChatShim:
             body = {"model": request["model"],
                     "messages": [{"role": "developer" if owner.model_id == "gpt-4o-mini" else "system", "content": request["instructions"]},
                                  {"role": "user", "content": request["input"]}],
-                    "max_tokens": owner.max_tokens, "stream": False}
+                    "max_tokens": owner.max_tokens, "stream": False, "store": False}
         result = owner._gateway.request(owner.route, body, "chat")
         if owner.route == "chat/completions":
             choices = result.get("choices")
@@ -420,8 +420,8 @@ class GMSStructuredModel(_LiveMixin, OpenAIStructuredModel):
     def metadata(self):
         result = self._metadata(super().metadata())
         result.update(route=self.route, structured_output="PROMPT_SCHEMA_AND_SERVER_VALIDATION",
-                      generation_settings=({"max_tokens": self.max_tokens, "stream": False} if self.route == "chat/completions" else {}),
-                      wire_fields=(["model", "messages", "max_tokens", "stream"] if self.route == "chat/completions"
+                      generation_settings=({"max_tokens": self.max_tokens, "stream": False, "store": False} if self.route == "chat/completions" else {}),
+                      wire_fields=(["model", "messages", "max_tokens", "stream", "store"] if self.route == "chat/completions"
                                    else ["model", "input"] if self.route == "responses" else []))
         return result
 

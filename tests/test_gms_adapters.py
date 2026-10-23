@@ -186,8 +186,9 @@ class GMSTests(unittest.TestCase):
         self.assertEqual(str(request.url), GMS_BASE_URL + "/chat/completions")
         self.assertEqual(request.headers["authorization"], "Bearer " + ENV["GMS_API_KEY"])
         body = json.loads(request.content)
-        self.assertEqual(set(body), {"model", "messages", "max_tokens", "stream"})
+        self.assertEqual(set(body), {"model", "messages", "max_tokens", "stream", "store"})
         self.assertIs(body["stream"], False)
+        self.assertIs(body["store"], False)
         self.assertEqual(body["messages"][0]["role"], "system")
         self.assertEqual(json.loads(body["messages"][1]["content"])["input"]["question"], "합성 질문")
         self.assertEqual([row for row in self.events if row[0] != "guard"],
@@ -313,7 +314,7 @@ class GMSTests(unittest.TestCase):
         self.assertEqual(metadata["provider"], "gms")
         self.assertFalse(metadata["live_verified"])
         self.assertEqual(metadata["retention_policy"], "NOT_VERIFIED")
-        self.assertNotIn("store", metadata["generation_settings"])
+        self.assertIs(metadata["generation_settings"]["store"], False)
         self.assertNotIn("text", metadata["generation_settings"])
         self.assertNotIn(ENV["GMS_API_KEY"], json.dumps(metadata))
         with self.scope(model):

@@ -85,7 +85,7 @@ def chat_upper_bound():
     body = {"model": ENV["GMS_CHAT_MODEL"], "messages": [
         {"role": "system", "content": json.dumps(envelope["policy"], ensure_ascii=False)},
         {"role": "user", "content": json.dumps({"input": envelope["input"]}, ensure_ascii=False)}],
-        "max_tokens": 64, "stream": False}
+        "max_tokens": 64, "stream": False, "store": False}
     wire_bytes = len(json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode())
     return Decimal(wire_bytes + 7 + 64) / 1000
 
