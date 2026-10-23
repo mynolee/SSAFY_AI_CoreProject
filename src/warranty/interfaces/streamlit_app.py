@@ -44,7 +44,8 @@ ERRORS = {
     "NEEDS_INFORMATION": "자료 또는 확인이 부족합니다. 누락 정보를 먼저 확인해 주세요.",
     "INTERNAL_ERROR": "요청을 처리하지 못했습니다. 잠시 후 다시 확인해 주세요.",
 }
-for _code in ("INVALID_INPUT", "INVALID_MONEY", "INVALID_TERMS", "INVALID_RETURN_CONDITIONS",
+for _code in ("INVALID_INPUT", "INVALID_MONEY", "INVALID_AMOUNT", "INVALID_ACTION_PAYLOAD",
+              "MUTATION_PRECONDITIONS_REQUIRED", "INVALID_TERMS", "INVALID_RETURN_CONDITIONS",
               "INVALID_ALLOCATIONS", "ZERO_ALLOCATION", "INVALID_EVIDENCE", "INVALID_TRANSFER_STATUS",
               "INVALID_DISPUTE_SCOPE", "INVALID_RESOLUTION", "INVALID_CONDITION_CHECKS"):
     ERRORS[_code] = ERRORS["VALIDATION_ERROR"]
@@ -54,6 +55,18 @@ for _code in ("TARGET_REVISION_MISMATCH", "APPROVAL_TARGET_MISMATCH", "EVIDENCE_
               "PROPOSAL_STALE", "RESOLUTION_STALE", "IDEMPOTENCY_CONFLICT", "TRADE_VERSION_CONFLICT"):
     ERRORS[_code] = ERRORS["VERSION_CONFLICT"]
 ERRORS.update({
+    "FUNDED_CONTRACT_IMMUTABLE": "예치된 계약의 D/W 금액은 변경할 수 없습니다. 현재 금액을 유지해 주세요.",
+    "ACTIVE_SETTLEMENT": "예약되었거나 결과를 확인 중인 정산 작업을 먼저 처리해 주세요.",
+    "TRADE_TERMINAL": "이미 종료되거나 취소된 거래입니다. 새 거래를 이용해 주세요.",
+    "INSUFFICIENT_WALLET": "시연 지갑의 가용 잔액이 부족합니다.",
+    "FUNDED_CURRENT_CONTRACT_REQUIRED": "현재 계약에 대한 양측 동의와 전액 시연 예치를 먼저 확인해 주세요.",
+    "W_CURRENT_REVIEW_REQUIRED": "채택 검토의 문서 버전·이용 범위가 변경되었습니다. 현재 자료로 검토하고 새 합의를 진행해 주세요.",
+    "REVIEW_NOT_VERIFIED": "현재 항목과 적용성에 맞는 서버 검토가 필요합니다. 조건을 확인한 뒤 다시 질문해 주세요.",
+    "INVALID_REVIEW": "채택할 검토의 조건과 근거를 확인해 주세요.",
+    "W_NOT_APPLICABLE": "보증 프리미엄 W가 있는 현재 계약에서 사용할 수 있는 요청입니다.",
+    "FUNDED_W_REQUIRED": "보증 프리미엄 W가 있는 예치 계약이 필요합니다.",
+    "RETRY_REQUIRES_FAILED": "확정 실패한 작업만 재시도할 수 있습니다. 결과 불명 작업은 대사를 요청해 주세요.",
+    "RETRY_CONFLICT": "관련 정산이나 분쟁 상태를 확인한 뒤 재시도해 주세요.",
     "FUNDED_CONTRACT_REQUIRED": "현재 계약에 대한 양측 동의와 전액 시연 예치가 필요합니다.",
     "PROPOSAL_CONSENT_REQUIRED": "현재 정산안의 정확한 배분·revision·hash에 양측 동의가 필요합니다.",
     "CONTRACT_CONSENT_REQUIRED": "현재 계약 revision·hash에 양측 동의가 필요합니다.",
@@ -276,6 +289,27 @@ def _review(st: Any, result: dict[str, Any], show_evidence: bool = True) -> None
     if show_evidence:
         st.caption("실제 인용한 근거")
         _evidence(st, result)
+
+
+def _checklist_context(st: Any, result: dict[str, Any]) -> None:
+    """Show the service-selected inputs and versions behind this checklist."""
+    with st.expander("이 체크리스트의 적용 조건·문서 버전", expanded=True):
+        st.text("검토 ID: " + str(result.get("review_id") or "현재 조건에 맞는 저장 검토 없음"))
+        st.text("문서 색인 revision: " + str(result.get("revision") or "미준비"))
+        inputs = result.get("applicability") or {}
+        if inputs:
+            for key, label in APPLICABILITY_LABELS.items():
+                if inputs.get(key):
+                    st.text(f"{label}: {inputs[key]}")
+        else:
+            st.caption("확인된 적용성 입력이 없습니다. 가입 조건을 입력한 뒤 질문해 주세요.")
+        documents = result.get("documents") or []
+        if not documents:
+            st.caption("이 체크리스트에 연결된 사용 가능한 문서 버전이 없습니다.")
+        for document in documents:
+            if isinstance(document, dict):
+                st.text(f"문서: {document.get('title', '제목 미확인')} · 버전: {document.get('version_id', '미확인')} · 역할: {document.get('role', '미확인')}")
+        st.caption("연결 문서와 실제 답변 인용은 구분합니다. 실제 인용 목록은 아래 근거 패널에서 확인하세요.")
 
 
 def _catalog(st: Any, app: Any) -> str | None:
@@ -568,6 +602,11 @@ def _rag(st: Any, app: Any, actor: str, item: dict[str, Any], applicability: dic
     prefix = conversation_key(actor, item_id)
     model_actions_blocked = gms_selected(runtime_status or {})
     checklist_ok, checklist = _call(st, lambda: app.rag.checklist(item_id, applicability=applicability, user_id=actor))
+    latest_key = f"latest_review:{prefix}"
+    if checklist_ok and checklist.get("review_id"):
+        st.session_state[latest_key] = checklist
+    else:
+        st.session_state.pop(latest_key, None)
     _document_readiness(st, checklist if checklist_ok else None)
     with st.expander("문서 준비·작업 진행"):
         st.caption("서버에 등록되고 이용 범위가 승인된 문서만 처리합니다. 임의 URL 입력과 실제 파일 업로드는 비활성입니다.")
@@ -581,8 +620,6 @@ def _rag(st: Any, app: Any, actor: str, item: dict[str, Any], applicability: dic
         st.caption("선택 항목과 현재 시연 사용자별로 대화를 보관합니다. 질문은 승인이나 지급을 실행하지 않습니다.")
         ok, history = _call(st, lambda: app.rag.history(actor, item_id))
         if ok:
-            if history:
-                st.session_state[f"latest_review:{prefix}"] = history[-1].get("result") or {}
             for message in history:
                 with st.chat_message("user"):
                     st.text(str(message.get("question", "")))
@@ -604,6 +641,7 @@ def _rag(st: Any, app: Any, actor: str, item: dict[str, Any], applicability: dic
                     st.rerun()
     with checklist_tab:
         if checklist_ok:
+            _checklist_context(st, checklist)
             _review(st, checklist)
             st.caption("거래에 채택하면 서버가 해당 검토와 문서 버전의 불변 스냅샷을 만듭니다. 채팅을 추가하는 것과 구분됩니다.")
 
@@ -693,6 +731,27 @@ def _trade(st: Any, app: Any, actor: str, item_id: str) -> None:
         approval_tab, settlement_tab, dispute_tab = st.tabs(["계약·수령·증빙", "정산안·실행", "분쟁·종료"])
         with approval_tab:
             st.caption("각 사용자는 자신의 동의만 기록합니다. 아래 요청도 동일한 서버 권한·버전 검증을 거칩니다.")
+            if actor in ("buyer", "seller"):
+                with st.form(f"revise_contract:{actor}:{trade_id}:{contract.get('revision')}"):
+                    st.caption("금액·반환 조건·증빙 기준을 수정하면 새 계약 revision이 됩니다. 양측 동의와 수령·증빙 확인을 다시 진행해야 합니다. 예치 후 금액 변경과 진행 중 정산의 변경 가능 여부는 서버가 검증합니다.")
+                    columns = st.columns(2)
+                    revised_d = columns[0].number_input("수정 물건 대금 D (시연 원)", min_value=1,
+                                                        value=int(contract.get("D", d)), step=1000)
+                    revised_w = columns[1].number_input("수정 보증 프리미엄 W (시연 원)", min_value=0,
+                                                        value=int(contract.get("W", w)), step=1000)
+                    terms = contract.get("terms") or {}
+                    returns = st.text_area("반환 조건 (한 줄에 하나)",
+                                           value="\n".join(terms.get("return_conditions") or []), max_chars=4000)
+                    evidence_standard = st.text_area("증빙 확인 기준", value=terms.get("evidence_standard", ""), max_chars=2000)
+                    deadline = st.text_input("증빙 확인 기한 (선택)", value=terms.get("confirmation_deadline") or "", max_chars=100)
+                    dispute_rule = st.text_area("분쟁 처리 규칙", value=terms.get("dispute_rule", ""), max_chars=2000)
+                    if st.form_submit_button("수정 조건으로 새 계약 revision 요청"):
+                        _mutate(st, app, actor, trade, "contract", {
+                            "D": int(revised_d), "W": int(revised_w),
+                            "terms": {"return_conditions": [line.strip() for line in returns.splitlines() if line.strip()],
+                                      "evidence_standard": evidence_standard.strip(),
+                                      "confirmation_deadline": deadline.strip() or None,
+                                      "dispute_rule": dispute_rule.strip()}})
             _text_list(st, trade.get("contract_consents"))
             if actor in ("buyer", "seller"):
                 exact_contract = {"revision": contract.get("revision"), "hash": contract.get("hash")}
@@ -702,7 +761,7 @@ def _trade(st: Any, app: Any, actor: str, item_id: str) -> None:
             latest = st.session_state.get(f"latest_review:{conversation_key(actor, item_id)}") or {}
             review_id = latest.get("review_id")
             if review_id:
-                st.text(f"채택할 최근 검토: {review_id}")
+                st.text(f"현재 적용 조건에 맞는 채택 검토: {review_id}")
                 st.caption("검토 채택 시 새 계약 revision을 만듭니다. 양측 계약 동의와 구매자 수령 확인을 새 revision에서 다시 기록해야 합니다.")
                 _action(st, app, actor, trade, "adopt_review", "이 검토를 계약에 채택 요청", {"review_id": review_id})
             st.caption("실제 증빙 업로드는 비활성입니다. 다음 버튼은 합성 증빙 참조만 만듭니다.")
@@ -758,6 +817,14 @@ def _trade(st: Any, app: Any, actor: str, item_id: str) -> None:
                 proposal = proposals[selected]
                 st.text(f"revision: {proposal.get('revision')} · hash: {proposal.get('hash')}")
                 st.dataframe(proposal.get("allocations", []), hide_index=True, width="stretch")
+                conditions = proposal.get("conditions") or {}
+                for field, label in (("contract_revision", "정산안의 계약 revision"),
+                                     ("review_id", "정산안의 채택 검토 ID"),
+                                     ("evidence_id", "정산안의 증빙 ID"),
+                                     ("refund_reason", "정산안의 반환 사유")):
+                    st.text(f"{label}: {conditions.get(field, proposal.get(field)) or '없음'}")
+                if conditions.get("resolution_context"):
+                    st.text("정산안에 연결된 해결안 ID: " + ", ".join(map(str, conditions["resolution_context"])))
                 _text_list(st, proposal.get("consents"))
                 exact = {key: proposal.get(key) for key in ("proposal_id", "revision", "hash")}
                 if actor in ("buyer", "seller"):
