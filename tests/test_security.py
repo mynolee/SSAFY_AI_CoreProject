@@ -1,5 +1,6 @@
 import socket
 import unittest
+from email.utils import formatdate
 from unittest.mock import patch
 
 from warranty.errors import ServiceError
@@ -196,6 +197,92 @@ class SourceSecurityTests(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         later = SafeFetcher(policy, lambda url: (429, {"retry-after": "120"}, b""), public_dns)
         self.assert_blocked(lambda: later.fetch("SYNTHETIC", SOURCE["url"]), "RETRY_LATER")
+
+    def test_deferred_retry_after_blocks_later_calls_to_same_host(self):
+        policy = self.policy([review()], network_enabled=True)
+        now, calls = [0.0], []
+        def transport(url):
+            calls.append(url)
+            return ((429, {"retry-after": "120"}, b"") if len(calls) == 1
+                    else (200, {"content-type": "text/html"}, b"ready"))
+        fetcher = SafeFetcher(policy, transport, public_dns, clock=lambda: now[0])
+        self.assert_blocked(lambda: fetcher.fetch("SYNTHETIC", SOURCE["url"]), "RETRY_LATER")
+        self.assert_blocked(lambda: fetcher.fetch("SYNTHETIC", SOURCE["url"]), "RETRY_LATER")
+        self.assertEqual(len(calls), 1)
+        now[0] = 120.0
+        self.assertEqual(fetcher.fetch("SYNTHETIC", SOURCE["url"]).body, b"ready")
+        self.assertEqual(len(calls), 2)
+
+    def test_http_date_retry_after_preserves_host_cooldown(self):
+        policy = self.policy([review()], network_enabled=True)
+        now, calls = [0.0], []
+        def transport(url):
+            calls.append(url)
+            return 503, {"retry-after": formatdate(1_000_120, usegmt=True)}, b""
+        fetcher = SafeFetcher(policy, transport, public_dns, clock=lambda: now[0])
+        with patch("warranty.security.time.time", return_value=1_000_000):
+            self.assert_blocked(lambda: fetcher.fetch("SYNTHETIC", SOURCE["url"]), "RETRY_LATER")
+            self.assert_blocked(lambda: fetcher.fetch("SYNTHETIC", SOURCE["url"]), "RETRY_LATER")
+        self.assertEqual(len(calls), 1)
+
+    def test_unbounded_numeric_retry_after_stays_deferred_without_overflow(self):
+        for size in (400, 5000):
+            with self.subTest(header_digits=size):
+                policy = self.policy([review()], network_enabled=True)
+                calls = []
+                def transport(url):
+                    calls.append(url)
+                    return 429, {"retry-after": "9" * size}, b""
+                fetcher = SafeFetcher(policy, transport, public_dns, clock=lambda: 0.0)
+                self.assert_blocked(lambda: fetcher.fetch("SYNTHETIC", SOURCE["url"]), "RETRY_LATER")
+                self.assert_blocked(lambda: fetcher.fetch("SYNTHETIC", SOURCE["url"]), "RETRY_LATER")
+                self.assertEqual(len(calls), 1)
+
+    def test_exhausted_retry_still_delays_next_call(self):
+        policy = self.policy([review()], network_enabled=True)
+        now, calls, waits = [0.0], [], []
+        def sleep(delay):
+            waits.append(delay)
+            now[0] += delay
+        def transport(url):
+            calls.append(url)
+            return ((429, {"retry-after": "5"}, b"") if len(calls) == 1
+                    else (200, {"content-type": "text/html"}, b"ready"))
+        fetcher = SafeFetcher(policy, transport, public_dns, clock=lambda: now[0], sleeper=sleep,
+                              max_retries=0)
+        self.assert_blocked(lambda: fetcher.fetch("SYNTHETIC", SOURCE["url"]), "FETCH_FAILED")
+        self.assertEqual(fetcher.fetch("SYNTHETIC", SOURCE["url"]).body, b"ready")
+        self.assertEqual(waits, [5.0])
+
+    def test_network_revoked_during_rate_wait_does_not_send(self):
+        policy = self.policy([review()], network_enabled=True)
+        now, calls = [0.0], []
+        def sleep(delay):
+            now[0] += delay
+            policy.network_enabled = False
+        def transport(url):
+            calls.append(url)
+            return 200, {"content-type": "text/html"}, b"ready"
+        fetcher = SafeFetcher(policy, transport, public_dns, clock=lambda: now[0], sleeper=sleep)
+        fetcher.fetch("SYNTHETIC", SOURCE["url"])
+        self.assert_blocked(lambda: fetcher.fetch("SYNTHETIC", SOURCE["url"]), "NETWORK_DISABLED")
+        self.assertEqual(len(calls), 1)
+
+    def test_source_replaced_and_reapproved_during_wait_cannot_send_stale_url(self):
+        policy = self.policy([review()], network_enabled=True,
+                             capabilities={"manager": {"DATA_MANAGER"}})
+        now, calls = [0.0], []
+        def sleep(delay):
+            now[0] += delay
+            policy.register_source("manager", {**SOURCE, "url": "https://example.org/replacement"})
+            policy.set_review("manager", review())
+        def transport(url):
+            calls.append(url)
+            return 200, {"content-type": "text/html"}, b"ready"
+        fetcher = SafeFetcher(policy, transport, public_dns, clock=lambda: now[0], sleeper=sleep)
+        fetcher.fetch("SYNTHETIC", SOURCE["url"])
+        self.assert_blocked(lambda: fetcher.fetch("SYNTHETIC", SOURCE["url"]), "SOURCE_BLOCKED")
+        self.assertEqual(len(calls), 1)
 
     def test_transport_uses_pinned_address_and_hostname(self):
         policy = self.policy([review()], network_enabled=True)

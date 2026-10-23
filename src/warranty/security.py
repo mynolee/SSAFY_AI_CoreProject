@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 from contextlib import contextmanager
 from datetime import date
+from email.utils import parsedate_to_datetime
 import copy
 import hashlib
 import hmac
@@ -493,7 +494,7 @@ class SafeFetcher:
         self.max_bytes, self.timeout, self.read_timeout = max_bytes, timeout, read_timeout
         self.interval, self.max_retries, self.max_redirects = interval, max_retries, max_redirects
         self.user_agent, self._clock, self._sleep = user_agent, clock, sleeper
-        self._last, self._lock = {}, threading.RLock()
+        self._last, self._cooldowns, self._lock = {}, {}, threading.RLock()
 
     def _limits(self, source):
         configured = source.get("http_limits", {})
@@ -541,12 +542,15 @@ class SafeFetcher:
         while True:
             if not self.policy.network_enabled:
                 _deny("NETWORK_DISABLED")
+            policy_generation = self.policy.generation
             self.policy.require(source_id, "fetch", actor, version_id)
             limits = self._limits(self.policy.source(source_id))
             # Resolve afresh for every attempt and redirect. Transport uses these IPs.
             validated = validate_url(current_url, source_id, self.policy, self._resolver)
             with self._lock:
-                delay = limits["interval"] - (self._clock() - self._last.get(validated.hostname, float("-inf")))
+                now = self._clock()
+                delay = max(limits["interval"] - (now - self._last.get(validated.hostname, float("-inf"))),
+                            self._cooldowns.get(validated.hostname, float("-inf")) - now)
                 if delay > 0:
                     if delay > 60:
                         raise ServiceError("RETRY_LATER", "출처의 요청 간격 대기가 필요합니다.", 429, True)
@@ -554,7 +558,13 @@ class SafeFetcher:
                 self._last[validated.hostname] = self._clock()
             # Rate/backoff waits and redirect responses never preserve a stale
             # approval for the next outbound request.
+            if not self.policy.network_enabled:
+                _deny("NETWORK_DISABLED")
             self.policy.require(source_id, "fetch", actor, version_id)
+            # Reapproval must not preserve a URL or HTTP-limit snapshot from
+            # an earlier registration. A fresh call validates the new scope.
+            if self.policy.generation != policy_generation:
+                _deny("SOURCE_BLOCKED")
             try:
                 status, headers, body = (self._transport(validated) if self._transport is not None
                                          else self._request(validated, limits))
@@ -575,16 +585,31 @@ class SafeFetcher:
                 redirects += 1
                 continue
             if status == 429 or 500 <= status <= 599:
+                raw_delay = headers.get("retry-after", "")
+                try:
+                    if raw_delay and not raw_delay.isdigit():
+                        retry_at = parsedate_to_datetime(raw_delay)
+                        if retry_at.tzinfo is None:
+                            raise ValueError("Retry-After needs a timezone")
+                        requested_delay = max(0, retry_at.timestamp() - time.time())
+                    else:
+                        # Float conversion saturates arbitrarily large decimal
+                        # delays to infinity instead of overflowing a deadline
+                        # or Python's bounded integer-string conversion. Such a
+                        # host stays deferred rather than being contacted early.
+                        requested_delay = float(raw_delay or "0")
+                except (ValueError, TypeError, OverflowError):
+                    raise ServiceError("RETRY_LATER", "출처의 재시도 대기가 필요합니다.", 429, True) from None
+                retry_delay = max(2 ** retries, requested_delay)
+                # Retry-After applies to later calls to this host too, including
+                # callers returning after a deferred or exhausted request.
+                with self._lock:
+                    self._cooldowns[validated.hostname] = max(self._cooldowns.get(validated.hostname, 0),
+                                                               self._clock() + retry_delay)
                 if retries >= limits["retries"]:
                     raise ServiceError("FETCH_FAILED", "문서 요청에 실패했습니다.", 502, True)
-                raw_delay = headers.get("retry-after", "")
-                if raw_delay and not raw_delay.isdigit():
-                    # Date-form Retry-After requires a later scheduled request; never retry early.
-                    raise ServiceError("RETRY_LATER", "출처의 재시도 대기가 필요합니다.", 429, True)
-                retry_delay = max(2 ** retries, int(raw_delay or 0))
                 if retry_delay > 60:
                     raise ServiceError("RETRY_LATER", "출처의 재시도 대기가 필요합니다.", 429, True)
-                self._sleep(retry_delay)
                 retries += 1
                 continue
             content_type = headers.get("content-type", "").split(";", 1)[0].strip().lower()
