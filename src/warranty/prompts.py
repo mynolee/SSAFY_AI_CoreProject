@@ -240,7 +240,10 @@ class StructuredRunner:
             allowed_candidates = [row.get("id") for row in variables["candidates"] if isinstance(row, dict)]
         if kind == "answer":
             allowed_evidence = [row.get("evidence_id") for row in variables["evidence"] if isinstance(row, dict)]
-        for attempt in range(2):
+        repairs = getattr(self.model, "format_repair_attempts", 1)
+        if type(repairs) is not int or repairs not in {0, 1}:
+            repairs = 0
+        for attempt in range(1 + repairs):
             self.last_attempts += 1
             try:
                 raw = self.model.generate(kind, prompt)
@@ -253,7 +256,7 @@ class StructuredRunner:
             try:
                 return validate_output(kind, raw, allowed_candidates, allowed_evidence)
             except ServiceError as exc:
-                if exc.code != "MODEL_OUTPUT_INVALID" or attempt == 1:
+                if exc.code != "MODEL_OUTPUT_INVALID" or attempt == repairs:
                     raise
                 # Do not append raw invalid output: it could contain instructions,
                 # confidential values or an attacker-controlled repair request.
