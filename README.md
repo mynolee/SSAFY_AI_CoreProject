@@ -54,6 +54,9 @@ $env:PRIVATE_DATA_DIR = '<저장소 밖 데이터 폴더>'
     "manager_actor": null,
     "worker_enabled": true
   },
+  "settlement": {
+    "max_attempts": 3
+  },
   "retrieval": {
     "chunk_size": 1000,
     "chunk_overlap": 200,
@@ -122,6 +125,8 @@ GMS의 동일 텍스트·게이트웨이·모델·버전·차원 임베딩은 �
 
 D 지급에는 구매자 수령 확인과 양측의 동일 정산안 승인이 필요합니다. W 지급에는 적용성이 확인된 검토와 양측의 동일 최신 증빙 확인도 필요합니다. 조건부 검토의 조건은 증빙 묶음에서 각각 명시적으로 확인하며, 모델의 조건 목록을 충족 확인으로 사용하지 않습니다. 환불은 계약의 반환 조건과 양측 승인에 따라 별도로 처리합니다. 원장은 복식 분개를 기록하고 결과가 불명확한 작업의 예약을 유지합니다.
 
+두 화면에서 기존 계약의 반환 조건·증빙 기준·확인 기한·분쟁 규칙을 수정할 수 있습니다. 새 계약 버전에는 양측의 새 동의가 필요하며, 예치 후에는 금액을 바꿀 수 없습니다. 정산 재시도 상한은 `MAX_SETTLEMENT_ATTEMPTS` 환경변수 또는 `runtime.json`의 `settlement.max_attempts`로 설정합니다. 허용 범위는 정수 1~10이고 기본값은 3이며, 실행 설정 파일이 환경변수보다 우선합니다. 결과가 불명확한 작업은 재실행 대신 대사로 확인합니다.
+
 GMS의 프로젝트 전체 크레딧 상한은 임베딩·재시도·동시 호출을 포함해 70,000입니다. 이 프로젝트의 예산 정책은 비시연 누적 35,000 이하와 시연용 35,000 보존입니다. 실제 LIVE 전 승인된 예산 프로필의 목적별 배정과 `demo_reserve_credits`가 이 정책을 지키는지 확인해야 합니다. 검증·평가·최종 확인·시연·임베딩 준비에 필요한 양만 사용합니다. 개발 중에는 합성 자료·모의 전송으로 검증합니다. 요청 횟수·입력 바이트 한도와 크레딧 상한은 함께 적용됩니다. 기본 요청·바이트 한도는 모두 0이고, 확정된 가격·입출력 상한·목적별 배정이 없으면 LIVE는 차단됩니다.
 
 `PRIVATE_CONFIG_DIR/live_budget.json`의 비활성 구조 예시는 다음과 같습니다. 실행에 사용할 가격이나 승인 범위를 포함하지 않습니다.
@@ -165,6 +170,15 @@ GMS의 프로젝트 전체 크레딧 상한은 임베딩·재시도·동시 호�
 ```powershell
 .\.venv\Scripts\python.exe -m warranty evaluate --cases (Join-Path $env:PRIVATE_CONFIG_DIR 'evaluation-cases.json') --evaluation-config (Join-Path $env:PRIVATE_CONFIG_DIR 'evaluation-config.json')
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+실패한 문서 준비 작업은 `retry-job --actor '<요청 주체>' --job-id '<작업 ID>'`로 다시 대기시킬 수 있습니다. 명시적 재시도는 실패·무결과 캐시의 대기시간을 우회하며, 이미 수집한 정상 본문은 재사용합니다. GMS LIVE 문서 준비는 전용 명령을 사용합니다.
+
+수집한 답변 비교 결과의 검토 양식은 아래 명령으로 만듭니다. 양식의 원응답 식별자와 확인한 기준 자료를 보존해 검토를 작성한 뒤 보고서를 생성합니다. 검토자 유형은 사람과 에이전트 보조를 구분하며, 검토 보고서가 전체 요구사항의 합격을 자동 판정하지 않습니다. 이 두 명령은 저장된 비공개 파일만 읽고 모델을 호출하지 않습니다.
+
+```powershell
+.\.venv\Scripts\python.exe -m warranty evaluate-review-template --artifact '<답변 비교 결과.json>' --output-dir '<비공개 검토 폴더>'
+.\.venv\Scripts\python.exe -m warranty evaluate-review --artifact '<답변 비교 결과.json>' --review '<작성한 검토.json>' --output-dir '<비공개 검토 폴더>'
 ```
 
 승인된 GMS 설정·가격 프로필·자료 처리 범위가 준비된 후에는 아래 전용 명령으로 LIVE를 실행합니다. 평가 설정 파일의 `mode`도 `LIVE`여야 합니다. LIVE 평가는 채팅·임베딩 모델 버전을 모두 명시하고, 같은 임베딩 모델·버전·차원으로 준비된 실제 공식 문서 색인이 필요합니다. 항목은 처리할 ID를 명시하며, 적용 조건 파일에는 확인한 범위만 기록합니다. `live-index-metadata`와 `live-prepare-documents`의 목적은 `embedding_preparation`이고, `live-query`의 목적은 `verification`, `final_verification`, `demo` 중에서 지정합니다. `live-prepare-documents`는 해당 명령 안에서 준비를 실행합니다. 일반 문서 작업 큐에 LIVE 권한을 저장하지 않습니다.
