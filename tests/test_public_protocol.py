@@ -4,8 +4,8 @@ import hashlib
 import json
 import unittest
 
-from warranty.public_protocol import (MAX_REQUEST_BYTES, PublicProtocol, public_instruction_hashes,
-                                      public_source_sha256)
+from warranty.public_protocol import (MAX_REQUEST_BYTES, MAX_OUTPUT_TOKENS, PUBLIC_INSTRUCTIONS,
+                                      PublicProtocol, public_instruction_hashes, public_source_sha256)
 from warranty.prompts import validate_output
 
 
@@ -154,6 +154,38 @@ class PublicProtocolTests(unittest.TestCase):
             with self.subTest(ungrounded=classification), self.assertRaisesRegex(ValueError, "CLASSIFICATION_INVALID"):
                 protocol.decode(prepared, json.dumps({"answer": "No supported conclusion.", "citations": [],
                                                       "classification": classification}))
+
+    def test_question_language_reply_keeps_safe_default_and_exact_local_citations(self):
+        question = "가상 기기의 공개 예시에는 어떤 절차가 있나요?"
+        config = manifest()
+        config["question_sha256s"] = [hashlib.sha256(question.encode("utf-8")).hexdigest()]
+        inputs = variables("answer")
+        inputs["question"] = question
+        protocol = PublicProtocol(config)
+        prepared = protocol.prepare("answer", inputs, [SOURCE])
+        reply = {"answer": "공개 예시에는 서면 확인 절차가 있습니다. [S1] 실제 계약의 적용 여부는 미확인입니다.",
+                 "citations": ["S1"]}
+        result = protocol.decode(prepared, json.dumps(reply, ensure_ascii=False))
+        self.assertEqual(result["classification"], "NEEDS_INFORMATION")
+        self.assertEqual(result["answer"], reply["answer"].replace("[S1]", "[7]"))
+        self.assertEqual(result["cited_evidence_ids"], [SOURCE["local_id"]])
+        self.assertEqual(prepared.max_output_tokens, 128)
+        self.assertEqual(MAX_OUTPUT_TOKENS, 512)
+
+    def test_bare_parenthetical_and_translated_markers_are_not_accepted(self):
+        protocol = PublicProtocol(manifest())
+        prepared = protocol.prepare("answer", variables("answer"), [SOURCE])
+        for text in ("An example clause S1", "An example clause (S1)",
+                     "예시 조항 (S1 참고)", "An example clause [source S1]"):
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, "MARKER_INVALID"):
+                protocol.decode(prepared, json.dumps({"answer": text, "citations": ["S1"]}))
+
+    def test_answer_instruction_hash_is_bound_to_current_public_policy(self):
+        config = manifest()
+        config["instruction_sha256s"]["answer"] = hashlib.sha256(
+            (PUBLIC_INSTRUCTIONS["answer"] + " altered").encode("utf-8")).hexdigest()
+        with self.assertRaisesRegex(ValueError, "INSTRUCTION_HASH_UNKNOWN"):
+            PublicProtocol(config)
 
     def test_optional_conditions_preserve_local_evidence_without_granting_authority(self):
         protocol = PublicProtocol(manifest())

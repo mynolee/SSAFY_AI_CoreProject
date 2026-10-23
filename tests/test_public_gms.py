@@ -263,6 +263,30 @@ class PublicGMSTests(unittest.TestCase):
                 self.assert_code("MODEL_OUTPUT_INVALID", lambda: self.call(model, "selection"))
                 self.assertEqual(len(self.requests), before + 1)
 
+    def test_answer_policy_requests_language_exact_markers_and_unverified_contract_default(self):
+        model = self.model()
+        self.result = response('{"answer":"An example procedure is described. [S1]","citations":["S1"]}')
+        result = self.call(model, "answer")
+        body = json.loads(self.requests[-1].content)
+        instruction = body["messages"][0]["content"]
+        for policy in ("same language as the question", "exact bracket form [S1]",
+                       "citations array must exactly match", "Prefer omitting classification",
+                       "actual contract scope or application is unverified", "Hypothetical question",
+                       "publication or effective dates", "never more than 512 tokens"):
+            self.assertIn(policy, instruction)
+        self.assertEqual(body["max_tokens"], 128)
+        self.assertEqual(result["classification"], "NEEDS_INFORMATION")
+        self.assertEqual(model.format_repair_attempts, 0)
+
+    def test_parenthetical_answer_citation_fails_once_without_repair(self):
+        model = self.model()
+        self.result = response('{"answer":"An example procedure (S1)","citations":["S1"]}')
+        self.assert_code("MODEL_OUTPUT_INVALID", lambda: self.call(model, "answer"))
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(len(self.credit.reservations), 1)
+        self.assertEqual(len(self.credit.settlements), 1)
+        self.assertEqual(model.format_repair_attempts, 0)
+
     def test_http_failure_does_not_retry_and_unknown_model_freezes_shared_credit(self):
         model = self.model()
         self.http_status = 503
