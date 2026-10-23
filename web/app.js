@@ -1,7 +1,7 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const state = { actor: null, csrf: null, selected: null, trade: null, offset: 0, limit: 12, total: 0, applicability: new Map(), reviews: new Map(), jobs: new Map(), jobWatches: new Map(), mutationKeys: new Map(), busy: new Set() };
+const state = { actor: null, csrf: null, selected: null, trade: null, offset: 0, limit: 12, total: 0, sessionEpoch: 0, viewEpoch: 0, applicability: new Map(), drafts: new Map(), reviews: new Map(), jobs: new Map(), jobWatches: new Map(), mutationKeys: new Map(), busy: new Set() };
 const won = (value) => value === null || value === undefined ? "미확인" : `${Number(value).toLocaleString("ko-KR")}원`;
 const asText = (value) => typeof value === "string" ? value : JSON.stringify(value, null, 2);
 const clear = (node) => node.replaceChildren();
@@ -37,6 +37,25 @@ function notice(message, info = false) {
 function errorText(error) {
   return `${error.code || "REQUEST_FAILED"} · ${error.message || "요청을 처리하지 못했습니다."}${error.retryable ? "\n재시도할 수 있습니다." : ""}${error.request_id ? `\n요청 ID: ${error.request_id}` : ""}`;
 }
+function saveItemInputs() {
+  if (!state.selected) return;
+  state.applicability.set(scope(), applicability());
+  state.drafts.set(scope(), $("question").value);
+}
+function clearSessionViews() {
+  state.actor = null; state.csrf = null; state.sessionEpoch++; state.viewEpoch++;
+  state.trade = null; state.actionPayload = null; state.jobWatches.clear();
+  $("session-status").textContent = "로그인 필요"; $("logout").disabled = true;
+  $("trade-content").hidden = true; $("question").value = "";
+  for (const input of document.querySelectorAll("[data-applicability]")) input.value = "";
+  for (const id of ["chat-log", "answer-meta", "evidence", "checklist", "job-status", "trade-summary", "trade-actions", "action-fields", "operations", "trade-json"]) clear($(id));
+  $("classification").textContent = "검토 전";
+  $("chat-log").append(el("p", "시연 로그인 후 항목별로 질문하고 이력을 확인할 수 있습니다.", "empty"));
+  const runtime = $("runtime-status");
+  if (runtime) runtime.textContent = "로그인 후 모델과 문서 처리의 설정 준비 상태를 확인할 수 있습니다.";
+}
+function viewContext() { return { actor: state.actor, itemId: state.selected?.item_id, sessionEpoch: state.sessionEpoch, viewEpoch: state.viewEpoch }; }
+function isCurrentView(context) { return context.actor === state.actor && context.itemId === state.selected?.item_id && context.sessionEpoch === state.sessionEpoch && context.viewEpoch === state.viewEpoch; }
 async function api(path, options = {}) {
   const headers = { Accept: "application/json" };
   const method = options.method || "GET";
@@ -45,6 +64,7 @@ async function api(path, options = {}) {
     if (state.csrf) headers["X-CSRF-Token"] = state.csrf;
   }
   if (options.key) headers["Idempotency-Key"] = options.key;
+  const sessionEpoch = state.sessionEpoch;
   let response;
   try {
     response = await fetch(path, { method, headers, credentials: "same-origin", body: method === "GET" ? undefined : JSON.stringify(options.body || {}) });
@@ -53,8 +73,9 @@ async function api(path, options = {}) {
   }
   let envelope;
   try { envelope = await response.json(); } catch (_) { throw { code: "INVALID_RESPONSE", message: "서버 응답을 확인할 수 없습니다." }; }
+  if (sessionEpoch !== state.sessionEpoch) throw { code: "CONTEXT_CHANGED", message: "사용자가 변경되었습니다. 현재 사용자로 다시 요청해 주세요." };
   if (!response.ok || envelope.error) {
-    if (response.status === 401) { state.csrf = null; state.actor = null; $("session-status").textContent = "다시 로그인 필요"; }
+    if (response.status === 401) { clearSessionViews(); $("session-status").textContent = "다시 로그인 필요"; }
     throw { ...(envelope.error || { code: "REQUEST_FAILED", message: "요청을 처리하지 못했습니다." }), request_id: envelope.request_id };
   }
   return envelope.data;
@@ -63,7 +84,7 @@ async function run(name, work) {
   if (state.busy.has(name)) return;
   state.busy.add(name);
   notice("");
-  try { await work(); } catch (error) { notice(errorText(error)); }
+  try { await work(); } catch (error) { if (error.code !== "CONTEXT_CHANGED") notice(errorText(error)); }
   finally { state.busy.delete(name); }
 }
 function requireItem() {
@@ -168,6 +189,7 @@ function applicability() {
 function restoreApplicability(itemId) {
   const values = state.applicability.get(scope(itemId)) || {};
   for (const input of document.querySelectorAll("[data-applicability]")) input.value = values[input.dataset.applicability] || "";
+  $("question").value = state.drafts.get(scope(itemId)) || "";
 }
 function addMessage(role, text, suffix = "") {
   for (const placeholder of $("chat-log").querySelectorAll(".empty")) placeholder.remove();
@@ -176,11 +198,11 @@ function addMessage(role, text, suffix = "") {
   $("chat-log").append(node); $("chat-log").scrollTop = $("chat-log").scrollHeight;
 }
 async function loadHistory(itemId) {
-  const actor = state.actor;
+  const context = viewContext();
   clear($("chat-log"));
   if (!state.actor) { $("chat-log").append(el("p", "시연 로그인 후 항목별로 질문하고 이력을 확인할 수 있습니다.", "empty")); return; }
   const history = await api(`/items/${encodeURIComponent(itemId)}/history`);
-  if (state.selected?.item_id !== itemId || state.actor !== actor) return;
+  if (!isCurrentView(context)) return;
   for (const entry of history) {
     if (entry.question) addMessage("user", entry.question);
     const result = entry.result || (entry.answer ? { answer: entry.answer, classification: entry.classification } : null);
@@ -191,8 +213,10 @@ async function loadHistory(itemId) {
   if (!history.length) $("chat-log").append(el("p", "선택한 항목에 관한 첫 질문을 남겨 보세요.", "empty"));
 }
 async function selectItem(itemId) {
-  if (state.selected) state.applicability.set(scope(), applicability());
+  saveItemInputs();
+  const epoch = ++state.viewEpoch;
   const item = await api(`/items/${encodeURIComponent(itemId)}`);
+  if (epoch !== state.viewEpoch) return;
   state.selected = item; restoreApplicability(itemId);
   $("detail").hidden = false; $("review-workspace").hidden = false;
   $("item-title").textContent = item.name;
@@ -211,6 +235,35 @@ async function selectItem(itemId) {
   for (const card of document.querySelectorAll("[data-item-id]")) card.classList.toggle("selected", card.dataset.itemId === itemId);
   await loadHistory(itemId);
 }
+function sourceLink(href, label = "등록된 원문 출처 열기 ↗") {
+  if (typeof href !== "string" || href.length > 2048 || /\s|[\x00-\x1f\x7f]/.test(href)) return null;
+  try {
+    const url = new URL(href);
+    if (url.protocol !== "https:" || !url.hostname || url.username || url.password || (url.port && url.port !== "443")) return null;
+    const link = el("a", label); link.href = url.href; link.target = "_blank"; link.rel = "noopener noreferrer"; return link;
+  } catch (_) { return null; }
+}
+function citedEvidence(result, requestedIds = result.cited_evidence_ids || []) {
+  const evidence = Array.isArray(result.evidence) ? result.evidence : Object.entries(result.evidence || {}).map(([id, row]) => ({ ...row, evidence_id: id }));
+  const allowed = new Set(result.cited_evidence_ids || []);
+  const byId = new Map(evidence.filter((row) => row && typeof row === "object").map((row) => [row.evidence_id || row.id, row]));
+  return [...new Set(requestedIds)].filter((id) => allowed.has(id) && byId.has(id)).map((id) => byId.get(id));
+}
+function appendEvidence(parent, result, requestedIds) {
+  const cited = citedEvidence(result, requestedIds);
+  for (const item of cited) {
+    const id = item.evidence_id || item.id;
+    const card = el("article", undefined, "evidence-card");
+    const marker = Number.isInteger(item.number) && item.number > 0 ? `[${item.number}]` : "근거 번호 미확인";
+    const type = { metadata: "메타데이터", official_document: "공식 문서", synthetic_document: "합성 시연 문서" }[item.source_type] || "종류 미확인";
+    card.append(el("strong", `${marker} ${item.title || "제목 미확인"}`), el("small", `${type}${item.type ? ` · ${item.type}` : ""} · ${item.role || item.document_role || "역할 미확인"}${item.page ? ` · ${item.page}쪽` : ""}${item.section ? ` · ${item.section}` : ""}`), el("small", `근거 ID: ${id}`));
+    if (item.version_id || item.document_version_id) card.append(el("small", `문서 버전: ${item.version_id || item.document_version_id}`));
+    if (item.text || item.excerpt) card.append(el("p", item.excerpt || item.text));
+    const link = sourceLink(item.source_url || item.url); if (link) card.append(link);
+    parent.append(card);
+  }
+  return cited.length;
+}
 function renderEvidence(result) {
   $("classification").textContent = STATUS[result.classification] || "미확인";
   clear($("answer-meta")); clear($("evidence"));
@@ -225,35 +278,32 @@ function renderEvidence(result) {
     const stages = { retrieve: "근거 검색", generate: "답변 생성", RETRIEVING: "근거 검색", GENERATING: "답변 생성", CHECKING_DOCUMENTS: "문서 확인", INDEXING: "문서 색인" };
     $("answer-meta").append(el("p", result.progress.map((step) => `${stages[step.stage] || "문서 처리"} · ${STATUS[step.status] || (step.status === "DONE" ? "완료" : "상태 확인")}`).join("\n"), "subtle"));
   }
-  const ids = new Set(result.cited_evidence_ids || []);
-  const all = Array.isArray(result.evidence) ? result.evidence : Object.values(result.evidence || {});
-  const cited = all.filter((item) => ids.has(item.evidence_id || item.id));
-  if (!cited.length) $("evidence").append(el("p", "실제 인용한 근거가 없습니다. 공식 조건은 확인되지 않았습니다.", "empty"));
-  for (const item of cited) {
-    const id = item.evidence_id || item.id;
-    const card = el("article", undefined, "evidence-card");
-    const marker = Number.isInteger(item.number) && item.number > 0 ? `[${item.number}]` : "근거 번호 미확인";
-    card.append(el("strong", `${marker} ${item.title || "제목 미확인"}`), el("small", `${item.source_type || "종류 미확인"} · ${item.role || item.document_role || "역할 미확인"}${item.page ? ` · ${item.page}쪽` : ""}${item.section ? ` · ${item.section}` : ""}`), el("small", `근거 ID: ${id}`));
-    if (item.text || item.excerpt) card.append(el("p", item.excerpt || item.text));
-    const href = item.source_url || item.url;
-    try {
-      const url = new URL(href);
-      if (url.protocol === "https:" && !url.username && !url.password && (!url.port || url.port === "443")) {
-        const link = el("a", "등록된 원문 출처 열기 ↗"); link.href = url.href; link.target = "_blank"; link.rel = "noopener noreferrer"; card.append(link);
-      }
-    } catch (_) { /* An absent or unsafe link remains plain text. */ }
-    $("evidence").append(card);
-  }
+  if (!appendEvidence($("evidence"), result)) $("evidence").append(el("p", "확인 가능한 근거를 찾지 못했습니다. 공식 조건은 확인되지 않았습니다.", "empty"));
 }
 function renderChecklist(data) {
   if (data.review_id) state.reviews.set(scope(), data);
   clear($("checklist"));
   const summary = el("div", `${STATUS[data.classification] || "미확인"}\n${readinessText(data.readiness)}`, "meta-block"); $("checklist").append(summary);
+  const inputs = Object.entries(data.applicability || {}).map(([key, value]) => `${LABELS[key] || key}: ${value}`);
+  $("checklist").append(el("p", `검토에 사용한 적용 정보\n${inputs.join("\n") || "입력 정보 없음"}\n색인 버전: ${data.revision || "미준비"}`, "subtle snapshot"));
+  for (const doc of data.documents || []) $("checklist").append(el("p", `검토 문서: ${doc.title || "제목 미확인"}\n문서 버전: ${doc.version_id || "미확인"}`, "subtle snapshot"));
   const conditions = data.conditions || data.checklist || [];
   if (!conditions.length) $("checklist").append(el("p", "공식 문서에서 확인한 이전 조건이 없습니다. 필요한 자료를 확인해 주세요.", "empty"));
-  for (const row of conditions) $("checklist").append(el("div", `${friendly(row)}${row.evidence_ids?.length ? `\n근거: ${row.evidence_ids.join(", ")}` : ""}`, "checklist-row"));
+  for (const row of conditions) {
+    const node = el("div", undefined, "checklist-row"); node.append(el("strong", friendly(row)));
+    if (!appendEvidence(node, data, row.evidence_ids || [])) node.append(el("p", "이 조건에 연결된 확인 가능한 인용 근거가 없습니다.", "subtle"));
+    $("checklist").append(node);
+  }
+  const clauseIds = new Set(conditions.flatMap((row) => row.evidence_ids || []));
+  const classificationIds = (data.cited_evidence_ids || []).filter((id) => !clauseIds.has(id));
+  if (citedEvidence(data, classificationIds).length) {
+    $("checklist").append(el("h4", "분류 검토 근거"));
+    appendEvidence($("checklist"), data, classificationIds);
+  }
+  if (!conditions.length && !citedEvidence(data).length) $("checklist").append(el("p", "확인 가능한 근거를 찾지 못했습니다.", "subtle"));
   if (data.missing_information?.length) $("checklist").append(el("div", `추가 확인\n${lines(data.missing_information)}`, "meta-block"));
   if (data.conflicts?.length) $("checklist").append(el("div", `상충 사항\n${lines(data.conflicts)}`, "meta-block"));
+  if (data.errors?.length) $("checklist").append(el("div", `오류·제약\n${lines(data.errors)}`, "meta-block"));
   if (data.review_id) $("checklist").append(el("p", `서버 검토 ID: ${data.review_id}`, "subtle"));
 }
 function tradeId() { return state.trade?.trade_id || state.trade?.id; }
@@ -321,7 +371,26 @@ function actionTemplate() {
   const hint = (text) => { $("action-hint").textContent = text; };
   state.actionPayload = () => ({});
   const evidence = Array.isArray(trade.evidence) ? trade.evidence.at(-1) : trade.evidence;
-  if (route === "evidence-bundles") {
+  if (route === "contracts") {
+    const terms = contract.terms || {};
+    const d = field("contract-d", "물건값 D · 원", { type: "number", value: contract.D, required: true }); d.min = "1";
+    const w = field("contract-w", "보증 프리미엄 W · 원", { type: "number", value: contract.W, required: true });
+    d.disabled = w.disabled = trade.funded === true || trade.funded === 1;
+    if (d.disabled) info("이미 예치한 금액은 변경할 수 없습니다. 금액을 바꾸려면 기존 거래의 정산을 합의한 뒤 새 거래를 만드세요.");
+    const standard = "합성 증빙을 양측이 확인"; const dispute = "배정 관리자 제안과 양측 동의"; const mutual = "양측 합의에 따른 반환";
+    field("evidence-standard", "증빙 확인 기준", { type: "textarea", value: terms.evidence_standard === "SYNTHETIC bilateral confirmation" ? standard : terms.evidence_standard || "", required: true });
+    field("deadline", "증빙 확인 기한 · 선택", { value: terms.confirmation_deadline || "" }).maxLength = 100;
+    field("return-conditions", "반환 조건 · 한 줄에 한 조건, 각 500자 이하", { type: "textarea", value: (terms.return_conditions || []).map((condition) => condition === "mutual_agreement" ? mutual : condition).join("\n"), required: true });
+    field("dispute-rule", "분쟁 해결 기준", { type: "textarea", value: terms.dispute_rule === "assigned administrator proposal and bilateral consent" ? dispute : terms.dispute_rule || "", required: true });
+    state.actionPayload = () => ({ D: amount("contract-d"), W: amount("contract-w"), terms: {
+      currency: "KRW", settlement_unit: 1,
+      evidence_standard: value("evidence-standard") === standard ? "SYNTHETIC bilateral confirmation" : value("evidence-standard"),
+      confirmation_deadline: value("deadline") || null,
+      return_conditions: value("return-conditions").split("\n").map((condition) => condition.trim()).filter(Boolean).map((condition) => condition === mutual ? "mutual_agreement" : condition),
+      dispute_rule: value("dispute-rule") === dispute ? "assigned administrator proposal and bilateral consent" : value("dispute-rule")
+    } });
+    hint("변경하면 새 계약 버전이 만들어집니다. 양측 계약 승인·수령 확인·증빙을 다시 확인하고, 필요한 정산안에 다시 합의하세요. 진행 중이거나 결과가 불명인 정산 작업은 먼저 처리해야 합니다.");
+  } else if (route === "evidence-bundles") {
     info("합성 이전 기록 1건을 시연 증빙 묶음으로 등록합니다. 실제 파일·진위 검사·자동 마스킹 자료가 아닙니다.");
     field("description", "기록 설명 · 선택", { value: "합성 시연 이전 기록" });
     const requiredIds = trade.review?.required_condition_ids || [];
@@ -377,7 +446,11 @@ function actionTemplate() {
       const selector = field("proposal", "확인할 정산안", { value: proposals.at(-1).proposal_id, options: proposals.map((proposal, index) => ({ value: proposal.proposal_id, label: `정산안 ${index + 1} · ${proposal.allocations.map((row) => `${row.component} 지급 ${won(row.pay_won)} / 환불 ${won(row.refund_won)}`).join(" · ")}` })) });
       const summary = el("p", undefined, "meta-block"); area.append(summary);
       const selected = () => proposals.find((proposal) => proposal.proposal_id === selector.value);
-      const update = () => { const proposal = selected(); summary.textContent = `같은 정산안에 승인한 당사자: ${(proposal.consents || []).map((consent) => consent.actor || consent.actor_id || consent.user_id).join(", ") || "아직 없음"}\n${proposal.allocations.map((row) => `${row.component}: 판매자 지급 ${won(row.pay_won)}, 구매자 환불 ${won(row.refund_won)}`).join("\n")}`; };
+      const update = () => {
+        const proposal = selected(); const conditions = proposal.conditions || {};
+        const reason = conditions.refund_reason;
+        summary.textContent = `정산안 버전: ${proposal.revision} · 연결 계약 버전: ${proposal.contract_revision ?? conditions.contract_revision ?? "미확인"}\n정산안 내용 확인값: ${proposal.hash || "미확인"}\n같은 정산안에 승인한 당사자: ${(proposal.consents || []).map((consent) => consent.actor || consent.actor_id || consent.user_id).join(", ") || "아직 없음"}\n${proposal.allocations.map((row) => `${row.component}: 판매자 지급 ${won(row.pay_won)}, 구매자 환불 ${won(row.refund_won)}`).join("\n")}\n이 정산안의 반환 조건: ${reason === "mutual_agreement" ? "양측 합의에 따른 반환" : reason || "환불 조건 없음"}\n연결 검토: ${conditions.review_id || proposal.review_id || "없음"}\n연결 증빙: ${conditions.evidence_id || proposal.evidence_id || "없음"}\n연결 분쟁 해결안: ${(conditions.resolution_context || []).join(", ") || "없음"}`;
+      };
       selector.addEventListener("change", update); update();
       state.actionPayload = () => { const proposal = selected(); return route === "settlement-consents" ? { proposal_id: proposal.proposal_id, revision: proposal.revision, hash: proposal.hash } : { proposal_id: proposal.proposal_id, revision: proposal.revision }; };
     }
@@ -410,16 +483,24 @@ function actionTemplate() {
 }
 
 $("login").addEventListener("click", () => run("login", async () => {
-  if (state.selected) state.applicability.set(scope(), applicability());
-  const data = await api("/session", { method: "POST", body: { actor: $("actor").value } });
-  state.actor = data.actor; state.csrf = data.csrf_token; $("session-status").textContent = `${data.actor} 로그인됨`;
+  saveItemInputs();
+  const previousTrade = tradeId(); const actor = $("actor").value;
+  clearSessionViews();
+  const data = await api("/session", { method: "POST", body: { actor } });
+  state.actor = data.actor; state.csrf = data.csrf_token; $("session-status").textContent = `${data.actor} 로그인됨`; $("logout").disabled = false;
   await loadRuntime();
   $("job-status").textContent = "";
   const savedJob = state.selected && state.jobs.get(scope());
   if (savedJob) renderJob(savedJob, state.selected.item_id, state.actor, !JOB_TERMINAL.has(savedJob.status));
   if (state.selected) { restoreApplicability(state.selected.item_id); clear($("answer-meta")); clear($("evidence")); clear($("checklist")); $("classification").textContent = "검토 전"; await loadHistory(state.selected.item_id); }
-  if (tradeId()) await reloadTrade();
+  if (previousTrade) renderTrade(await api(`/trades/${encodeURIComponent(previousTrade)}`));
   notice("로컬 시연 사용자로 로그인했습니다.", true);
+}));
+$("logout").addEventListener("click", () => run("logout", async () => {
+  saveItemInputs();
+  try { await api("/logout", { method: "POST", body: {} }); }
+  finally { clearSessionViews(); }
+  notice("시연 세션을 종료했습니다.", true);
 }));
 $("search-form").addEventListener("submit", (event) => { event.preventDefault(); run("search", async () => {
   const fee = $("max-fee").value; const data = await api("/search", { method: "POST", body: { query: $("query").value, provider: $("provider").value || null, max_fee: fee === "" ? null : Number(fee), transfer_required: $("transfer-required").checked } });
@@ -427,15 +508,15 @@ $("search-form").addEventListener("submit", (event) => { event.preventDefault();
 }); });
 $("reset-items").addEventListener("click", () => run("items", () => loadItems()));
 $("chat-form").addEventListener("submit", (event) => { event.preventDefault(); run("chat", async () => {
-  const itemId = requireItem(); const actor = state.actor; const question = $("question").value.trim(); if (!question) return;
+  const itemId = requireItem(); const context = viewContext(); const question = $("question").value.trim(); if (!question) return;
   const button = $("chat-form").querySelector("button"); button.disabled = true; const oldText = button.textContent; button.textContent = "근거 검색 · 답변 생성 중…";
-  addMessage("user", question); $("question").value = "";
+  addMessage("user", question); $("question").value = ""; state.drafts.set(scope(itemId), "");
   try {
     const result = await api("/chat", { method: "POST", body: { item_id: itemId, question, applicability: applicability(), top_k: Number($("top-k").value), strategy: $("strategy").value } });
-    if (state.selected?.item_id === itemId && state.actor === actor) { addMessage("assistant", result.answer || "확인할 수 있는 답변이 없습니다.", result.classification); renderEvidence(result); }
+    if (isCurrentView(context)) { addMessage("assistant", result.answer || "확인할 수 있는 답변이 없습니다.", result.classification); renderEvidence(result); }
   } finally { button.disabled = false; button.textContent = oldText; }
 }); });
-$("checklist-button").addEventListener("click", () => run("checklist", async () => { const id = requireItem(); const actor = state.actor; const data = await api(`/items/${encodeURIComponent(id)}/checklist`, { method: "POST", body: { applicability: applicability() } }); if (state.selected?.item_id === id && state.actor === actor) renderChecklist(data); }));
+$("checklist-button").addEventListener("click", () => run("checklist", async () => { const id = requireItem(); const context = viewContext(); const data = await api(`/items/${encodeURIComponent(id)}/checklist`, { method: "POST", body: { applicability: applicability() } }); if (isCurrentView(context)) renderChecklist(data); }));
 $("prepare").addEventListener("click", () => run("prepare", async () => {
   const itemId = requireItem(); const actor = state.actor; $("job-status").textContent = "등록된 문서 준비 작업을 요청하고 있습니다…";
   const question = $("question").value.trim();
@@ -454,6 +535,6 @@ $("advanced-action").addEventListener("submit", (event) => { event.preventDefaul
 }); });
 run("initial", async () => {
   await loadItems();
-  try { const data = await api("/session"); state.actor = data.actor; state.csrf = data.csrf_token; $("actor").value = data.actor; $("session-status").textContent = `${data.actor} 로그인됨`; } catch (error) { if (error.code !== "AUTH_REQUIRED") throw error; }
+  try { const data = await api("/session"); state.actor = data.actor; state.csrf = data.csrf_token; $("actor").value = data.actor; $("session-status").textContent = `${data.actor} 로그인됨`; $("logout").disabled = false; } catch (error) { if (error.code !== "AUTH_REQUIRED") throw error; }
   await loadRuntime();
 });
